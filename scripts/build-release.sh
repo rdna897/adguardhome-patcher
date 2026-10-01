@@ -5,7 +5,7 @@
 # Usage: scripts/build-release.sh <tag> [out-dir]
 #
 # On success, out-dir (default: dist) contains:
-#   agh-dashboard-range.tar.gz         build/static and build/VERSION
+#   agh-dashboard-range.tar.gz         frontend, version and revision manifest
 #   agh-dashboard-range.tar.gz.sha256
 #   agh-dashboard-range-source.tar.gz  patched source and build/install scripts
 #   agh-dashboard-range-source.tar.gz.sha256
@@ -15,6 +15,11 @@
 # against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
 # production build, and a smoke test that runs the official binary of the
 # release with the patched UI.  Set SMOKE_TEST=0 to skip the last step.
+#
+# The UI manifest's patch_revision is the SHA-256 artefact revision of the built
+# build/static files.  Webpack's CSS names include a compilation hash that
+# depends on the absolute source path, so the frontend is always built at one
+# fixed path: equivalent builds then produce identical bytes and revisions.
 
 set -euo pipefail
 
@@ -36,7 +41,7 @@ fi
 
 work=$(mktemp -d)
 trap '$SUDO rm -rf "$work"' EXIT
-src="$work/agh"
+src=/tmp/adguardhome-patcher-frontend-build
 
 log() { printf '::notice::%s\n' "$*" >&2; }
 
@@ -116,7 +121,13 @@ smoke_test() {
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
 
+# Never reuse or delete a directory this run did not create.
+mkdir "$src" 2>/dev/null \
+	|| fail "fixed frontend build path $src already exists; remove it after any other build finishes"
+trap '$SUDO rm -rf "$work" "$src"' EXIT
+
 step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
+step "manual patcher install/update/uninstall tests" python3 "$repo_root/scripts/tests/test-patcher.py"
 
 log "building $tag with patch made against $patch_base"
 git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
@@ -145,7 +156,7 @@ step "npm ci" npm ci --no-audit --no-fund
 step "typecheck" npm run typecheck
 step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
 step "unit tests" npx vitest --run
-step "production build" npm run build-prod
+step "production build" sh "$repo_root/scripts/frontend-build.sh"
 [ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
 
 if [ "$BROWSER_TEST" = 1 ]; then
@@ -163,12 +174,21 @@ echo "$tag" >"$src/build/VERSION"
 cp "$src/LICENSE.txt" "$src/build/LICENSE.txt"
 printf 'Modified AdGuard Home dashboard by adguardhome-patcher.\nUpstream: %s\nBuilt: %s\nSource: agh-dashboard-range-source.tar.gz in the same release.\n' \
 	"$tag" "$(date -u +%F)" >"$src/build/NOTICE"
-tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE
+frontend_revision=$(python3 "$repo_root/scripts/release-manifest.py" "$tag" "$src/build") \
+	|| fail "couldn't record the frontend artefact revision"
+log "frontend artefact revision: $frontend_revision"
+tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE build/MANIFEST.json
 (cd "$out" && sha256sum agh-dashboard-range.tar.gz >agh-dashboard-range.tar.gz.sha256)
 mkdir -p "$src/patcher"
 cp -r "$repo_root/patch" "$repo_root/scripts" "$repo_root/install" "$src/patcher/"
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$src/patcher/"
+mkdir -p "$src/patcher/docs"
+cp "$repo_root/docs/manual-updates.md" "$src/patcher/docs/"
+mkdir -p "$src/patcher/.github/workflows"
+cp "$repo_root/.github/workflows/build.yml" "$src/patcher/.github/workflows/"
 tar czf "$out/agh-dashboard-range-source.tar.gz" \
-	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' -C "$src" .
+	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' \
+	--exclude='*/__pycache__' --exclude='*.pyc' -C "$src" .
 (cd "$out" && sha256sum agh-dashboard-range-source.tar.gz >agh-dashboard-range-source.tar.gz.sha256)
+step "release manifest and packaged management tooling" python3 "$repo_root/scripts/release-manifest.py" --verify "$tag" "$out"
 log "$tag passed the compatibility gate"

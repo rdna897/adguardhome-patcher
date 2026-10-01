@@ -60,7 +60,9 @@ jobs:
       issues: read
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
-      patch_sha: ${{ steps.pick.outputs.patch_sha }}
+      frontend_input_sha: ${{ steps.pick.outputs.frontend_input_sha }}
+      tooling_sha: ${{ steps.pick.outputs.tooling_sha }}
+      patch_sha: ${{ steps.artifact.outputs.patch_sha }}
       skip: ${{ steps.pick.outputs.skip }}
       build_outcome: ${{ steps.build.outcome }}
     steps:
@@ -85,22 +87,25 @@ jobs:
             echo '::error::Expected an AdGuard Home release tag such as v0.107.79'
             exit 1
           fi
-          patch_sha=$(git ls-files -z patch scripts install README.md LICENSE \
-            | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          # Build-input and tooling fingerprints only decide whether to rebuild. The
+          # published frontend revision is computed from the built files below.
+          frontend_input_sha=$(python3 scripts/release-manifest.py --frontend-input)
+          tooling_sha=$(python3 scripts/release-manifest.py --tooling)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
+          echo "frontend_input_sha=$frontend_input_sha" >> "$GITHUB_OUTPUT"
+          echo "tooling_sha=$tooling_sha" >> "$GITHUB_OUTPUT"
 
           existing=$(gh release view "ui-$tag" --json body --jq .body 2>/dev/null || true)
           if [ "$FORCE_REBUILD" != 'true' ]; then
-            if grep -Fq "patch: $patch_sha" <<<"$existing"; then
-              echo "ui-$tag already built for patch $patch_sha"
+            if grep -Fxq "frontend-input: $frontend_input_sha" <<<"$existing" && grep -Fxq "tooling: $tooling_sha" <<<"$existing"; then
+              echo "ui-$tag already built from frontend inputs $frontend_input_sha and tooling $tooling_sha"
               echo 'skip=true' >> "$GITHUB_OUTPUT"
             fi
             # Public issues cannot impersonate reports made by this workflow.
             if gh issue list --state open --author 'github-actions[bot]' \
-              --search "label:incompatible $tag $patch_sha in:body" \
+              --search "label:incompatible $tag $frontend_input_sha $tooling_sha in:body" \
               --json number --jq '.[].number' | grep -q .; then
-              echo "$tag is already reported incompatible with patch $patch_sha"
+              echo "$tag is already reported incompatible with frontend inputs $frontend_input_sha"
               echo 'skip=true' >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -116,6 +121,15 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.pick.outputs.tag }}
         run: scripts/build-release.sh "$RELEASE_TAG" dist
+
+      - name: Read verified frontend artefact revision
+        id: artifact
+        if: steps.build.outcome == 'success'
+        env:
+          RELEASE_TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          patch_sha=$(python3 scripts/release-manifest.py --artifact "$RELEASE_TAG" dist)
+          echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
 
       - name: Save release assets or failure reason
         if: always() && steps.build.outcome != 'skipped' && steps.pick.outputs.tag != ''
@@ -146,6 +160,8 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.build.outputs.tag }}
       PATCH_SHA: ${{ needs.build.outputs.patch_sha }}
+      FRONTEND_INPUT_SHA: ${{ needs.build.outputs.frontend_input_sha }}
+      TOOLING_SHA: ${{ needs.build.outputs.tooling_sha }}
       BUILD_COMMIT: ${{ github.sha }}
       BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -159,6 +175,12 @@ jobs:
         run: |
           (cd dist && sha256sum -c agh-dashboard-range.tar.gz.sha256 \
             && sha256sum -c agh-dashboard-range-source.tar.gz.sha256)
+          # The release notes must name exactly the frontend revision in the archive.
+          manifest_sha=$(tar -xzOf dist/agh-dashboard-range.tar.gz build/MANIFEST.json | jq -r .patch_revision)
+          if [[ ! "$PATCH_SHA" =~ ^[a-f0-9]{64}$ ]] || [ "$manifest_sha" != "$PATCH_SHA" ]; then
+            echo '::error::Verified frontend artefact revision does not match the archive manifest'
+            exit 1
+          fi
           cat >release-notes.md <<EOF
           Patched dashboard UI for AdGuard Home $RELEASE_TAG.
 
@@ -167,6 +189,8 @@ jobs:
           included in agh-dashboard-range-source.tar.gz in this release.
 
           patch: $PATCH_SHA
+          frontend-input: $FRONTEND_INPUT_SHA
+          tooling: $TOOLING_SHA
           commit: $BUILD_COMMIT
           run: $BUILD_RUN_URL
           EOF
@@ -181,7 +205,7 @@ jobs:
 
           for n in $(gh issue list --state open --author 'github-actions[bot]' \
             --search "label:incompatible $RELEASE_TAG in:title" --json number --jq '.[].number'); do
-            gh issue close "$n" --comment "Resolved: ui-$RELEASE_TAG was built with patch $PATCH_SHA."
+            gh issue close "$n" --comment "Resolved: ui-$RELEASE_TAG was built with frontend $PATCH_SHA."
           done
 
       - name: Report incompatible release
@@ -195,11 +219,12 @@ jobs:
           Servers on $RELEASE_TAG keep the stock dashboard until the patch is updated.
 
           tag: $RELEASE_TAG
-          patch: $PATCH_SHA
+          frontend-input: $FRONTEND_INPUT_SHA
+          tooling: $TOOLING_SHA
           run: $BUILD_RUN_URL
           EOF
           existing=$(gh issue list --state open --author 'github-actions[bot]' \
-            --search "label:incompatible $RELEASE_TAG $PATCH_SHA in:body" --json number --jq '.[].number')
+            --search "label:incompatible $RELEASE_TAG $FRONTEND_INPUT_SHA $TOOLING_SHA in:body" --json number --jq '.[].number')
           if [ -z "$existing" ]; then
             gh issue create --label incompatible \
               --title "$RELEASE_TAG: dashboard patch is not compatible" --body-file issue-body.md
