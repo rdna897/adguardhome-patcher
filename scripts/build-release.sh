@@ -12,7 +12,7 @@
 # On failure, it exits non-zero and writes the reason to out-dir/REASON.
 #
 # Gate: the stats API still documents "recent", the patch applies (three-way
-# against PATCH_BASE), typecheck, eslint on the patched files, unit tests,
+# against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
 # production build, and a smoke test that runs the official binary of the
 # release with the patched UI.  Set SMOKE_TEST=0 to skip the last step.
 
@@ -27,6 +27,7 @@ patch_file="$repo_root/patch/dashboard-range.patch"
 patch_base=$(cat "$repo_root/patch/PATCH_BASE")
 REPO_URL=${REPO_URL:-https://github.com/AdguardTeam/AdGuardHome.git}
 SMOKE_TEST=${SMOKE_TEST:-1}
+BROWSER_TEST=${BROWSER_TEST:-0}
 
 SUDO=
 if [ "$(id -u)" != 0 ]; then
@@ -115,6 +116,8 @@ smoke_test() {
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
 
+step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
+
 log "building $tag with patch made against $patch_base"
 git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
 
@@ -132,6 +135,9 @@ if git -C "$src" diff --name-only --diff-filter=U | grep -q .; then
 	fail "the patch has merge conflicts"
 fi
 
+# --3way stages the applied patch; checking only the working diff misses it.
+step "applied-source whitespace" "$repo_root/scripts/check-applied-whitespace.sh" "$src"
+
 mapfile -t ts_files < <(grep '^+++ b/client/' "$patch_file" | sed 's#^+++ b/client/##' | grep -E '\.tsx?$')
 
 cd "$src/client"
@@ -141,6 +147,13 @@ step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
 step "unit tests" npx vitest --run
 step "production build" npm run build-prod
 [ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
+
+if [ "$BROWSER_TEST" = 1 ]; then
+	if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]; then
+		step "install Chromium for browser checks" npx playwright install --with-deps chromium --only-shell
+	fi
+	step "Live Query Log browser checks" node "$repo_root/scripts/tests/live-query-log-browser.cjs" "$src"
+fi
 
 if [ "$SMOKE_TEST" = 1 ]; then
 	step "smoke test against the official $tag binary" smoke_test

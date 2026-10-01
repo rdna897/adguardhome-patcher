@@ -224,7 +224,7 @@ index 0000000..b660f72
 +});
 diff --git a/client/src/__tests__/queryLogsRequests.test.ts b/client/src/__tests__/queryLogsRequests.test.ts
 new file mode 100644
-index 0000000..37c936f
+index 0000000..88922aa
 --- /dev/null
 +++ b/client/src/__tests__/queryLogsRequests.test.ts
 @@ -0,0 +1,142 @@
@@ -316,7 +316,7 @@ index 0000000..37c936f
 +
 +    it.each([false, true])('keeps queued queries through client block/unblock (initially blocked: %s)', async (blocked) => {
 +        const store = createStore(combineReducers({ queryLogs, access }), applyMiddleware(thunk));
-+        const dispatch: any = store.dispatch;
++        const { dispatch }: { dispatch: any } = store;
 +        dispatch(getLogsSuccess({ logs: normalizeLogs([rawRow(1)]), oldest: rawRow(1).time, older_than: '' }));
 +        dispatch(setLiveLogsEnabled(true));
 +        dispatch(receiveLiveLogs({ logs: normalizeLogs([rawRow(2), rawRow(1)]), atTop: false }));

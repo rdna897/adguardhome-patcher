@@ -183,17 +183,19 @@ On the existing Query Log page, click **Paused** to enable **Live**, or click **
 
 Live mode polls the existing Query Log API about once per second after each completed request; it uses no WebSocket, backend push stream, or modified AdGuard Home binary. Hidden tabs suspend polling. Failed requests keep the displayed entries and retry after five seconds.
 
-While you are reading older rows, arrivals wait behind a **new queries ↑** button. Click it to return to the newest entries; scrolling back to the top also reveals them. The browser keeps at most **500 displayed rows and 500 queued arrivals**, without changing server storage. **Clear view** clears only this browser view, keeping the server query log intact. Use Refresh to reload the saved log.
+While you are reading older rows, arrivals wait behind a **new queries ↑** button. Click it to return to the newest entries; scrolling back to the top also reveals them. Client block/unblock row actions preserve queued arrivals and their indicator. The browser keeps at most **500 displayed rows and 500 queued arrivals**, without changing server storage. **Clear view** clears only this browser view, keeping the server query log intact. Use Refresh to reload the saved log; changing filters also starts a new filtered view.
 
 Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long requests completing outside the retained time window, or time spent in a hidden tab can leave gaps in this troubleshooting view; the server log remains available through the normal paused/Refresh view. Added control labels fall back to English, like the dashboard range selector.
 
 ## Building and changing the patch
 
-Requires Node.js 22, git, curl, tar, and sudo when the smoke test needs elevated permissions.
+Requires Node.js 22, Python 3, git, curl, tar, and sudo when the smoke test needs elevated permissions. Python is used only for the build validation regression checks.
 
 ```sh
 scripts/build-release.sh v0.107.79
 ```
+
+PR validation also runs the production UI at desktop and mobile viewport sizes, using mocked API responses, controlled visibility events, and browser timers. Run the same complete gate locally with `BROWSER_TEST=1 scripts/build-release.sh v0.107.79`; it installs headless Chromium and its system dependencies unless `PLAYWRIGHT_CHROMIUM_EXECUTABLE` points to an existing browser. The checks cover Live/Paused, pending arrivals through client block/unblock, Show Newest, browser-only clearing, filters, visibility, failure recovery, paused pagination, and navigation cleanup.
 
 To edit the frontend patch:
 
@@ -202,11 +204,15 @@ git clone --depth 1 --branch "$(cat patch/PATCH_BASE)" https://github.com/Adguar
 cd agh
 git apply ../patch/dashboard-range.patch
 # Edit client/..., then:
-git add -N .
-git diff > ../patch/dashboard-range.patch
+git add -N client
+git diff --binary -- client ':!client/node_modules' > ../patch/dashboard-range.patch
 ```
 
-The workflow runs every six hours, on changes to build/install inputs on `main`, and on manual dispatch. It uses pinned actions, read access during builds, and a separate publishing job. No repository secrets are required. Enable Actions and Issues; watch this repository's issues for compatibility reports.
+Pull requests to `main` validate their exact head SHA against the supported release in `patch/PATCH_BASE` (currently v0.107.79), using the same build script. The PR job has only `contents: read`, disables persisted checkout credentials, and does not publish releases, upload release artifacts, or modify issues. It uses `pull_request`, never `pull_request_target`.
+
+The gate checks both staged and unstaged applied source with `git diff --check`: three-way patch application stages changes, so a working-tree check alone is insufficient. Only trailing-whitespace checks on `patch/dashboard-range.patch` are exempt because blank context lines require a space; other patch checks remain enabled, and applied source is checked with the normal trailing-space, blank-EOF, and space-before-tab rules. Regression checks ensure malformed staged or unstaged source fails even when its patch artifact is exempt.
+
+Trusted `main` builds still run every six hours, on pushes, and on manual dispatch. Pinned actions and read access during builds are followed by a separate publishing job guarded by the repository, `main` ref, and trusted event types. No repository secrets are required. Enable Actions and Issues; watch this repository's issues for compatibility reports.
 
 Releases include the UI archive, its checksum, and a corresponding source archive with the patched upstream code, license, and this project's build and installation scripts under `patcher/`.
 
