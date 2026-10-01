@@ -6,7 +6,7 @@ Add a time range selector to the AdGuard Home dashboard: **Default**, **Last 1 /
 
 ![Custom 13 hours](docs/custom13h.png)
 
-The patch runs with the official AdGuard Home binary or Docker image. It changes the frontend only; your configuration, statistics database, and query log stay intact. Downloads require no GitHub account or token.
+The patch runs with the official AdGuard Home binary or Docker image. It changes the frontend only; your configuration, statistics database, and query log stay intact.
 
 ## How it works
 
