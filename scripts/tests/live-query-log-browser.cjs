@@ -25,6 +25,7 @@ async function check(browser, viewport) {
     const consoleErrors = [];
     const endpoints = [];
     const requests = [];
+    const responses = [];
     const accessWrites = [];
     let failNextLive = false;
     let serverClears = 0;
@@ -79,6 +80,7 @@ async function check(browser, viewport) {
                 (!params.older_than || row.time < params.older_than))
                 .sort((left, right) => right.time.localeCompare(left.time)).slice(0, Number(params.limit));
             body = { data, oldest: data.at(-1)?.time || '' };
+            responses.push({ count: data.length, newest: data[0]?.time });
         } else if (endpoint === 'querylog_clear') {
             serverClears += 1;
         } else if (endpoint === 'filtering/status') {
@@ -132,6 +134,16 @@ async function check(browser, viewport) {
     const tick = async (ms = 1200) => {
         await page.clock.runFor(ms);
         await page.waitForLoadState('networkidle');
+    };
+    const nextPoll = async () => {
+        const before = await liveCount();
+        // A response schedules the next timer after crossing the real transport boundary.
+        // Advancing virtual time once can finish a prior poll without starting the next one.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            await tick();
+            if (await liveCount() > before) return;
+        }
+        assert.fail('Expected a new Live poll after advancing the browser clock');
     };
     const visibility = state => page.evaluate(value => {
         Object.defineProperty(document, 'visibilityState', { configurable: true, value });
@@ -256,11 +268,11 @@ async function check(browser, viewport) {
         await expect(clear).toBeFocused();
         await clear.press('Space');
         await expect(rows).toHaveCount(0);
-        await tick();
+        await nextPoll();
         await expect(rows).toHaveCount(0);
         assert.equal(serverClears, 0);
         records.unshift(rawRow(238));
-        await tick();
+        await nextPoll();
         await expect(rows).toHaveCount(1);
 
         await visibility('hidden');
@@ -343,6 +355,8 @@ async function check(browser, viewport) {
         console.error('Browser diagnostics:', {
             viewport, errors, visibility: await page.evaluate(() => document.visibilityState),
             recentRequests: requests.slice(-4),
+            recentResponses: responses.slice(-4),
+            liveRequests: await liveCount(), scrollY: await page.evaluate(() => scrollY),
             buttons: await page.getByRole('button').allTextContents(),
             body: (await page.locator('body').innerText()).slice(0, 400),
             url: page.url(), consoleErrors: consoleErrors.slice(0, 2), endpoints: [...new Set(endpoints)],
