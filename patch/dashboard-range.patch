@@ -1,0 +1,805 @@
+diff --git a/client/src/__tests__/Line.test.tsx b/client/src/__tests__/Line.test.tsx
+new file mode 100644
+index 0000000..84a9384
+--- /dev/null
++++ b/client/src/__tests__/Line.test.tsx
+@@ -0,0 +1,56 @@
++import React from 'react';
++import ReactDOM from 'react-dom';
++import { act } from 'react-dom/test-utils';
++import { Provider } from 'react-redux';
++import { createStore } from 'redux';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import Line from '../components/ui/Line';
++import { DAY, TIME_UNITS } from '../helpers/constants';
++
++// Give the real Recharts area a fixed viewport in jsdom.
++vi.mock('recharts', async (importOriginal) => {
++    const actual = await importOriginal<typeof import('recharts')>();
++
++    return {
++        ...actual,
++        ResponsiveContainer: ({ children }: { children: React.ReactElement }) =>
++            React.cloneElement(children, { width: 400, height: 120 }),
++    };
++});
++
++describe('dashboard chart rendering', () => {
++    let container: HTMLDivElement;
++
++    afterEach(() => {
++        if (container) {
++            ReactDOM.unmountComponentAtNode(container);
++            container.remove();
++        }
++    });
++
++    it.each([[3118], [447], [0]])('draws a full-width area/line for the single bucket %j', (value) => {
++        container = document.createElement('div');
++        document.body.appendChild(container);
++        const store = createStore(() => ({ stats: { interval: 30 * DAY, timeUnits: TIME_UNITS.HOURS } }));
++
++        act(() => {
++            ReactDOM.render(
++                <Provider store={store}>
++                    <Line data={[value]} color="#F67247" />
++                </Provider>,
++                container,
++            );
++        });
++
++        const curve = container.querySelector('.recharts-area-curve');
++        const path = curve?.getAttribute('d');
++        const endpoints = path?.match(/^M([\d.]+),([\d.]+)L([\d.]+),([\d.]+)$/);
++
++        expect(endpoints).not.toBeNull();
++        expect(Number(endpoints?.[3]) - Number(endpoints?.[1])).toBeGreaterThan(300);
++        expect(endpoints?.[2]).toBe(endpoints?.[4]);
++        expect(container.querySelector('.recharts-area-area')).not.toBeNull();
++        expect(container.querySelectorAll('.recharts-dot')).toHaveLength(0);
++    });
++});
+diff --git a/client/src/__tests__/lineUtils.test.ts b/client/src/__tests__/lineUtils.test.ts
+new file mode 100644
+index 0000000..3768ece
+--- /dev/null
++++ b/client/src/__tests__/lineUtils.test.ts
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from 'vitest';
++
++import { TIME_UNITS } from '../helpers/constants';
++import { buildChartData } from '../components/ui/lineUtils';
++
++describe('dashboard chart history', () => {
++    const now = new Date(2026, 9, 1, 10, 30).getTime();
++
++    it('shows a single hour as a flat value with one hourly tooltip', () => {
++        const values = [3118];
++        const points = buildChartData(values, TIME_UNITS.HOURS, now);
++
++        expect(points).toHaveLength(2);
++        expect(points.map((point) => point.value)).toEqual([3118, 3118]);
++        expect(points.map((point) => point.label)).toEqual(['1 Oct 10:00', '1 Oct 10:00']);
++        expect(values).toEqual([3118]);
++    });
++
++    it('keeps a single zero bucket at zero', () => {
++        expect(buildChartData([0], TIME_UNITS.HOURS, now).map((point) => point.value)).toEqual([0, 0]);
++    });
++
++    it('labels a shorter hourly range using the returned buckets', () => {
++        const points = buildChartData([10, 20, 30], TIME_UNITS.HOURS, now);
++
++        expect(points.map((point) => point.value)).toEqual([10, 20, 30]);
++        expect(points.map((point) => point.label)).toEqual(['1 Oct 08:00', '1 Oct 09:00', '1 Oct 10:00']);
++    });
++
++    it('keeps daily history anchored to today', () => {
++        expect(buildChartData([10, 20], TIME_UNITS.DAYS, now).map((point) => point.label)).toEqual([
++            '30 Sep 2026',
++            '1 Oct 2026',
++        ]);
++    });
++
++    it('keeps empty history empty', () => {
++        expect(buildChartData([], TIME_UNITS.HOURS, now)).toEqual([]);
++    });
++});
+diff --git a/client/src/__tests__/statsRange.test.ts b/client/src/__tests__/statsRange.test.ts
+new file mode 100644
+index 0000000..61a1fbe
+--- /dev/null
++++ b/client/src/__tests__/statsRange.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it } from 'vitest';
++
++import { DAY, HOUR } from '../helpers/constants';
++import { getRangeHours, getRecentMs, getStatsRangeKey, isRangeAvailable } from '../helpers/statsRange';
++
++describe('statsRange', () => {
++    const retention = DAY * 30;
++
++    it('returns null for the default range', () => {
++        expect(getRecentMs({ type: 'default' }, retention)).toBeNull();
++    });
++
++    it('converts hour ranges', () => {
++        expect(getRecentMs({ type: 'hours', hours: 6 }, retention)).toBe(6 * HOUR);
++        expect(getRecentMs({ type: 'custom', hours: 13 }, retention)).toBe(13 * HOUR);
++    });
++
++    it('falls back to the retention period for long ranges', () => {
++        expect(getRecentMs({ type: 'hours', hours: 24 * 30 }, retention)).toBeNull();
++        expect(getRecentMs({ type: 'hours', hours: 24 * 7 }, DAY)).toBeNull();
++        expect(isRangeAvailable({ type: 'hours', hours: 24 * 7 }, DAY)).toBe(false);
++        expect(isRangeAvailable({ type: 'hours', hours: 24 }, DAY)).toBe(true);
++    });
++
++    it('counts today including the current hour', () => {
++        expect(getRangeHours({ type: 'today' }, new Date(2026, 9, 1, 0, 10))).toBe(1);
++        expect(getRangeHours({ type: 'today' }, new Date(2026, 9, 1, 9, 33))).toBe(10);
++    });
++
++    it('maps ranges to selector keys', () => {
++        expect(getStatsRangeKey({ type: 'hours', hours: 24 * 7 })).toBe('7d');
++        expect(getStatsRangeKey({ type: 'custom', hours: 5 })).toBe('custom');
++        expect(getStatsRangeKey({ type: 'today' })).toBe('today');
++    });
++});
+diff --git a/client/src/actions/stats.ts b/client/src/actions/stats.ts
+index 05b189e..f102d35 100644
+--- a/client/src/actions/stats.ts
++++ b/client/src/actions/stats.ts
+@@ -3,6 +3,7 @@ import { createAction } from 'redux-actions';
+ import apiClient from '../api/Api';
+ import { normalizeTopStats, secondsToMilliseconds, getParamsForClientsSearch, addClientInfo } from '../helpers/helpers';
+ import { addErrorToast, addSuccessToast } from './toasts';
++import { getRangeHours, getRecentMs, loadStatsRange } from '../helpers/statsRange';
+ 
+ export const getStatsConfigRequest = createAction('GET_STATS_CONFIG_REQUEST');
+ export const getStatsConfigFailure = createAction('GET_STATS_CONFIG_FAILURE');
+@@ -39,10 +40,26 @@ export const getStatsRequest = createAction('GET_STATS_REQUEST');
+ export const getStatsFailure = createAction('GET_STATS_FAILURE');
+ export const getStatsSuccess = createAction('GET_STATS_SUCCESS');
+ 
++// getRecentForSelectedRange returns the "recent" parameter for the dashboard
++// range selected in this browser, or null for the full retention period.
++const getRecentForSelectedRange = async (): Promise<number | null> => {
++    const range = loadStatsRange();
++    if (getRangeHours(range) === null) {
++        return null;
++    }
++
++    // Requesting more than the retention period is an error, so always check
++    // the current one.
++    const { interval } = await apiClient.getStatsConfig();
++
++    return getRecentMs(range, interval);
++};
++
+ export const getStats = () => async (dispatch: any) => {
+     dispatch(getStatsRequest());
+     try {
+-        const stats = await apiClient.getStats();
++        const recentMs = await getRecentForSelectedRange();
++        const stats = await apiClient.getStats(recentMs);
+         const normalizedTopClients = normalizeTopStats(stats.top_clients);
+ 
+         const clientsParams = getParamsForClientsSearch(normalizedTopClients, 'name');
+diff --git a/client/src/api/Api.ts b/client/src/api/Api.ts
+index 5eed570..e9d0dd6 100644
+--- a/client/src/api/Api.ts
++++ b/client/src/api/Api.ts
+@@ -563,10 +563,11 @@ class Api {
+ 
+     STATS_RESET = { path: 'stats_reset', method: 'POST' };
+ 
+-    getStats() {
++    getStats(recentMs?: number | null) {
+         const { path, method } = this.GET_STATS;
++        const fullPath = recentMs ? `${path}?recent=${recentMs}` : path;
+ 
+-        return this.makeRequest(path, method);
++        return this.makeRequest(fullPath, method);
+     }
+ 
+     getStatsConfig() {
+diff --git a/client/src/components/Dashboard/Dashboard.css b/client/src/components/Dashboard/Dashboard.css
+index 3f794a1..b54db78 100644
+--- a/client/src/components/Dashboard/Dashboard.css
++++ b/client/src/components/Dashboard/Dashboard.css
+@@ -45,8 +45,22 @@
+ 
+ @media (max-width: 767.98px) {
+     .page-title--dashboard {
+-        flex-direction: column;
+-        align-items: flex-start;
++        width: 100%;
++        flex-wrap: wrap;
++        gap: 0.5rem;
++    }
++
++    .page-title--dashboard .page-title {
++        flex-basis: 100%;
++    }
++
++    .page-title--dashboard .page-title__protection {
++        margin: 0;
++    }
++
++    .page-title--dashboard > .btn,
++    .page-title--dashboard .page-title__protection .btn {
++        min-height: 40px;
+     }
+ }
+ 
+@@ -85,3 +99,115 @@
+         flex-shrink: 0;
+     }
+ }
++
++.stats-range {
++    display: flex;
++    flex-wrap: wrap;
++    align-items: center;
++    gap: 0.5rem;
++    margin-left: 0.5rem;
++}
++
++.stats-range select.form-control:not([size]):not([multiple]),
++.stats-range input.form-control {
++    height: calc(1.5em + 0.5rem + 2px);
++    padding-top: 0.25rem;
++    padding-bottom: 0.25rem;
++    font-size: 0.8125rem;
++    line-height: 1.5;
++}
++
++.stats-range__select {
++    width: auto;
++}
++
++.stats-range__custom {
++    display: flex;
++    align-items: center;
++    gap: 0.5rem;
++}
++
++.stats-range__input {
++    width: 5rem;
++}
++
++.stats-range__unit {
++    width: auto;
++}
++
++@media (max-width: 767.98px) {
++    .stats-range {
++        flex-basis: 100%;
++        min-width: 0;
++        margin: 0;
++    }
++
++    .stats-range__select {
++        flex: 1 1 auto;
++        min-width: 0;
++        max-width: 100%;
++    }
++
++    .stats-range__custom {
++        flex-basis: 100%;
++        flex-wrap: wrap;
++    }
++
++    .stats-range select.form-control:not([size]):not([multiple]),
++    .stats-range input.form-control {
++        min-height: 40px;
++        font-size: 16px;
++    }
++
++    .stats-range__custom .btn {
++        min-height: 40px;
++    }
++}
++
++@media (max-width: 575.98px) {
++    .dashboard-statistics {
++        display: grid;
++        grid-template-columns: repeat(2, minmax(0, 1fr));
++        gap: 0.75rem;
++        margin: 0;
++    }
++
++    .dashboard-statistics > [class*='col-'] {
++        min-width: 0;
++        max-width: 100%;
++        padding: 0;
++    }
++
++    .dashboard-statistics .stats-card {
++        padding-bottom: 0;
++    }
++
++    .dashboard-statistics .card--stats {
++        min-height: 112px;
++    }
++
++    .dashboard-statistics .stats-card__header {
++        flex-wrap: wrap;
++        gap: 4px 8px;
++        padding: 12px 10px 0;
++    }
++
++    .dashboard-statistics .stats-card__value {
++        max-width: 100%;
++        font-size: clamp(16px, 4.5vw, 20px);
++        overflow-wrap: anywhere;
++    }
++
++    .dashboard-statistics .stats-card__percent {
++        font-size: 12px;
++    }
++
++    .dashboard-statistics .stats-card__chart {
++        height: 48px;
++        padding: 0 2px;
++    }
++
++    .dashboard-statistics .stats-card__title {
++        overflow-wrap: anywhere;
++    }
++}
+diff --git a/client/src/components/Dashboard/Statistics.tsx b/client/src/components/Dashboard/Statistics.tsx
+index ec08d11..a20ebe9 100644
+--- a/client/src/components/Dashboard/Statistics.tsx
++++ b/client/src/components/Dashboard/Statistics.tsx
+@@ -29,7 +29,7 @@ const Statistics = ({
+     numReplacedSafebrowsing,
+     numReplacedParental,
+ }: StatisticsProps) => (
+-    <div className="row">
++    <div className="row dashboard-statistics">
+         <div className="col-sm-6 col-lg-3">
+             <StatsCard
+                 total={numDnsQueries}
+diff --git a/client/src/components/Dashboard/StatsRangeSelector.tsx b/client/src/components/Dashboard/StatsRangeSelector.tsx
+new file mode 100644
+index 0000000..2d9b5c1
+--- /dev/null
++++ b/client/src/components/Dashboard/StatsRangeSelector.tsx
+@@ -0,0 +1,148 @@
++import React, { useEffect, useState } from 'react';
++import { useTranslation } from 'react-i18next';
++
++import { HOUR } from '../../helpers/constants';
++import {
++    STATS_RANGE_PRESETS,
++    STATS_RANGE_TYPES,
++    StatsRange,
++    ensureStatsRangeStrings,
++    getStatsRangeKey,
++    isRangeAvailable,
++} from '../../helpers/statsRange';
++
++const CUSTOM_UNITS = {
++    HOURS: 'hours',
++    DAYS: 'days',
++};
++
++interface StatsRangeSelectorProps {
++    range: StatsRange;
++    retentionMs: number;
++    disabled?: boolean;
++    onChange: (range: StatsRange) => void;
++}
++
++const getPresetLabel = (t: (key: string, options?: object) => string, key: string) => {
++    switch (key) {
++        case 'default':
++            return t('stats_range_default');
++        case 'today':
++            return t('stats_range_today');
++        case 'custom':
++            return t('stats_range_custom');
++        default: {
++            const preset = STATS_RANGE_PRESETS.find((p) => p.key === key);
++            const hours = preset?.range.hours ?? 0;
++
++            return hours >= 48 && hours % 24 === 0
++                ? t('stats_range_last_days', { count: hours / 24 })
++                : t('stats_range_last_hours', { count: hours });
++        }
++    }
++};
++
++const StatsRangeSelector = ({ range, retentionMs, disabled, onChange }: StatsRangeSelectorProps) => {
++    ensureStatsRangeStrings();
++    const { t } = useTranslation();
++
++    const selectedKey = getStatsRangeKey(range);
++    const [showCustom, setShowCustom] = useState(selectedKey === 'custom');
++    const [customValue, setCustomValue] = useState('');
++    const [customUnit, setCustomUnit] = useState(CUSTOM_UNITS.HOURS);
++
++    useEffect(() => {
++        if (selectedKey !== 'custom' || !range.hours) {
++            return;
++        }
++
++        if (range.hours % 24 === 0) {
++            setCustomValue(String(range.hours / 24));
++            setCustomUnit(CUSTOM_UNITS.DAYS);
++        } else {
++            setCustomValue(String(range.hours));
++            setCustomUnit(CUSTOM_UNITS.HOURS);
++        }
++    }, [selectedKey, range.hours]);
++
++    const customNumber = Number(customValue);
++    const customHours = customUnit === CUSTOM_UNITS.DAYS ? customNumber * 24 : customNumber;
++    const customValid = Number.isInteger(customNumber) && customNumber > 0;
++    const customTooLong = customValid && retentionMs > 0 && customHours * HOUR > retentionMs;
++
++    const handleSelect = (e: React.ChangeEvent<HTMLSelectElement>) => {
++        const { value } = e.target;
++        if (value === 'custom') {
++            setShowCustom(true);
++
++            return;
++        }
++
++        setShowCustom(false);
++
++        const preset = STATS_RANGE_PRESETS.find((p) => p.key === value);
++        if (preset) {
++            onChange(preset.range);
++        }
++    };
++
++    const applyCustom = (e: React.FormEvent) => {
++        e.preventDefault();
++        if (!customValid || customTooLong) {
++            return;
++        }
++
++        onChange({ type: STATS_RANGE_TYPES.CUSTOM, hours: customHours });
++    };
++
++    return (
++        <div className="stats-range">
++            <select
++                className="form-control custom-select custom-select-sm stats-range__select"
++                aria-label={t('stats_range_label')}
++                title={t('stats_range_label')}
++                value={showCustom ? 'custom' : selectedKey}
++                disabled={disabled}
++                onChange={handleSelect}>
++                {STATS_RANGE_PRESETS.map(({ key, range: presetRange }) => (
++                    <option key={key} value={key} disabled={!isRangeAvailable(presetRange, retentionMs)}>
++                        {getPresetLabel(t, key)}
++                    </option>
++                ))}
++            </select>
++
++            {showCustom && (
++                <form className="stats-range__custom" onSubmit={applyCustom}>
++                    <input
++                        type="number"
++                        min={1}
++                        step={1}
++                        className="form-control form-control-sm stats-range__input"
++                        aria-label={t('stats_range_custom')}
++                        placeholder="12"
++                        value={customValue}
++                        onChange={(e) => setCustomValue(e.target.value)}
++                    />
++
++                    <select
++                        className="form-control custom-select custom-select-sm stats-range__unit"
++                        value={customUnit}
++                        onChange={(e) => setCustomUnit(e.target.value)}>
++                        <option value={CUSTOM_UNITS.HOURS}>{t('stats_range_unit_hours')}</option>
++                        <option value={CUSTOM_UNITS.DAYS}>{t('stats_range_unit_days')}</option>
++                    </select>
++
++                    <button
++                        type="submit"
++                        className="btn btn-outline-primary btn-sm"
++                        disabled={!customValid || customTooLong || disabled}
++                        title={customTooLong ? t('stats_range_too_long') : undefined}>
++                        {t('apply_btn')}
++                    </button>
++                </form>
++            )}
++        </div>
++    );
++};
++
++export default StatsRangeSelector;
+diff --git a/client/src/components/Dashboard/index.tsx b/client/src/components/Dashboard/index.tsx
+index 897c304..d999feb 100644
+--- a/client/src/components/Dashboard/index.tsx
++++ b/client/src/components/Dashboard/index.tsx
+@@ -1,4 +1,4 @@
+-import React, { useEffect } from 'react';
++import React, { useEffect, useState } from 'react';
+ 
+ import { HashLink as Link } from 'react-router-hash-link';
+ import { Trans, useTranslation } from 'react-i18next';
+@@ -21,6 +21,15 @@ import Dropdown from '../ui/Dropdown';
+ import UpstreamResponses from './UpstreamResponses';
+ 
+ import UpstreamAvgTime from './UpstreamAvgTime';
++import StatsRangeSelector from './StatsRangeSelector';
++import {
++    STATS_RANGE_TYPES,
++    StatsRange,
++    ensureStatsRangeStrings,
++    getRecentMs,
++    loadStatsRange,
++    saveStatsRange,
++} from '../../helpers/statsRange';
+ import { AccessData, DashboardData, StatsData } from '../../initialState';
+ 
+ interface DashboardProps {
+@@ -43,7 +52,15 @@ const Dashboard = ({
+     stats,
+     access,
+ }: DashboardProps) => {
++    ensureStatsRangeStrings();
+     const { t } = useTranslation();
++    const [statsRange, setStatsRange] = useState<StatsRange>(loadStatsRange);
++
++    const handleStatsRangeChange = (range: StatsRange) => {
++        saveStatsRange(range);
++        setStatsRange(range);
++        getStats();
++    };
+ 
+     const getAllStats = () => {
+         getAccessList();
+@@ -59,6 +76,19 @@ const Dashboard = ({
+             return t('stats_disabled_short');
+         }
+ 
++        const recentMs = getRecentMs(statsRange, stats.interval);
++        if (recentMs !== null) {
++            if (statsRange.type === STATS_RANGE_TYPES.TODAY) {
++                return t('stats_range_for_today');
++            }
++
++            const hours = msToHours(recentMs);
++
++            return hours >= 48 && hours % 24 === 0
++                ? t('for_last_days', { count: hours / 24 })
++                : t('for_last_hours', { count: hours });
++        }
++
+         const msIn7Days = 604800000;
+ 
+         if (stats.timeUnits === TIME_UNITS.HOURS && stats.interval === msIn7Days) {
+@@ -173,6 +203,13 @@ const Dashboard = ({
+                 <button type="button" className="btn btn-outline-primary btn-sm" onClick={getAllStats}>
+                     <Trans>refresh_statics</Trans>
+                 </button>
++
++                <StatsRangeSelector
++                    range={statsRange}
++                    retentionMs={stats.interval}
++                    disabled={!stats.enabled}
++                    onChange={handleStatsRangeChange}
++                />
+             </PageTitle>
+ 
+             {statsProcessing && <Loading />}
+diff --git a/client/src/components/ui/Line.tsx b/client/src/components/ui/Line.tsx
+index 9085526..4760257 100644
+--- a/client/src/components/ui/Line.tsx
++++ b/client/src/components/ui/Line.tsx
+@@ -31,9 +31,8 @@ const CustomTooltip = ({ active, payload }: TooltipProps<number, string>) => {
+ };
+ 
+ const Line = ({ data, color = 'black' }: LineProps) => {
+-    const interval = useSelector((state: RootState) => state.stats.interval);
+     const timeUnits = useSelector((state: RootState) => state.stats.timeUnits);
+-    const chartData = buildChartData(data, interval, timeUnits);
++    const chartData = buildChartData(data, timeUnits);
+ 
+     return (
+         <ResponsiveContainer width="100%" height="100%" minHeight={16}>
+diff --git a/client/src/components/ui/lineUtils.ts b/client/src/components/ui/lineUtils.ts
+index ba2de57..d4a8ffb 100644
+--- a/client/src/components/ui/lineUtils.ts
++++ b/client/src/components/ui/lineUtils.ts
+@@ -3,7 +3,7 @@ import subDays from 'date-fns/sub_days';
+ import subHours from 'date-fns/sub_hours';
+ import dateFormat from 'date-fns/format';
+ 
+-import { TIME_UNITS } from '../../helpers/constants';
++import { DAY, HOUR, TIME_UNITS } from '../../helpers/constants';
+ import { msToDays, msToHours } from '../../helpers/helpers';
+ 
+ export type HistoryPoint = {
+@@ -31,12 +31,19 @@ export const formatHistoryLabel = (
+ 
+ export const buildChartData = (
+     values: number[],
+-    interval: number,
+     timeUnits: string,
+     now = Date.now(),
+-): HistoryPoint[] =>
+-    values.map((value, index) => ({
++): HistoryPoint[] => {
++    // A selected range can be shorter than retention. Anchor the returned
++    // buckets to the current hour/day rather than the configured retention.
++    const interval = values.length * (timeUnits === TIME_UNITS.HOURS ? HOUR : DAY);
++    const points = values.map((value, index) => ({
+         index,
+         value,
+         label: formatHistoryLabel(index, interval, timeUnits, now),
+     }));
++
++    // One bucket has no trend. Draw its value across the chart, with the same
++    // tooltip at both ends, without inventing another hour of statistics.
++    return points.length === 1 ? [points[0], { ...points[0], index: 1 }] : points;
++};
+diff --git a/client/src/helpers/statsRange.ts b/client/src/helpers/statsRange.ts
+new file mode 100644
+index 0000000..817e51b
+--- /dev/null
++++ b/client/src/helpers/statsRange.ts
+@@ -0,0 +1,153 @@
++// Dashboard statistics time range.  The selected range is kept in the browser
++// only, so neither the configuration file nor the statistics database change.
++
++import i18next from 'i18next';
++
++import { HOUR } from './constants';
++import { LocalStorageHelper } from './localStorageHelper';
++import { BASE_LOCALE } from './twosky';
++
++export const STATS_RANGE_STORAGE_KEY = 'dashboard_stats_range';
++
++export const STATS_RANGE_TYPES = {
++    DEFAULT: 'default',
++    HOURS: 'hours',
++    TODAY: 'today',
++    CUSTOM: 'custom',
++};
++
++export type StatsRange = {
++    type: string;
++    // hours is the length of the range in hours for HOURS and CUSTOM types.
++    hours?: number;
++};
++
++export const DEFAULT_STATS_RANGE: StatsRange = { type: STATS_RANGE_TYPES.DEFAULT };
++
++// STATS_RANGE_PRESETS are the predefined ranges shown in the selector.
++export const STATS_RANGE_PRESETS: { key: string; range: StatsRange }[] = [
++    { key: 'default', range: DEFAULT_STATS_RANGE },
++    { key: '1h', range: { type: STATS_RANGE_TYPES.HOURS, hours: 1 } },
++    { key: '6h', range: { type: STATS_RANGE_TYPES.HOURS, hours: 6 } },
++    { key: '12h', range: { type: STATS_RANGE_TYPES.HOURS, hours: 12 } },
++    { key: '24h', range: { type: STATS_RANGE_TYPES.HOURS, hours: 24 } },
++    { key: 'today', range: { type: STATS_RANGE_TYPES.TODAY } },
++    { key: '7d', range: { type: STATS_RANGE_TYPES.HOURS, hours: 24 * 7 } },
++    { key: '30d', range: { type: STATS_RANGE_TYPES.HOURS, hours: 24 * 30 } },
++    { key: 'custom', range: { type: STATS_RANGE_TYPES.CUSTOM } },
++];
++
++const isValidHours = (hours: unknown): hours is number =>
++    typeof hours === 'number' && Number.isInteger(hours) && hours > 0;
++
++export const getStatsRangeKey = (range: StatsRange): string => {
++    if (range.type === STATS_RANGE_TYPES.HOURS) {
++        const preset = STATS_RANGE_PRESETS.find(
++            (p) => p.range.type === STATS_RANGE_TYPES.HOURS && p.range.hours === range.hours,
++        );
++
++        return preset ? preset.key : 'custom';
++    }
++
++    return range.type;
++};
++
++export const loadStatsRange = (): StatsRange => {
++    const stored = LocalStorageHelper.getItem(STATS_RANGE_STORAGE_KEY);
++    if (!stored || typeof stored !== 'object') {
++        return DEFAULT_STATS_RANGE;
++    }
++
++    const { type, hours } = stored;
++    switch (type) {
++        case STATS_RANGE_TYPES.TODAY:
++            return { type };
++        case STATS_RANGE_TYPES.HOURS:
++        case STATS_RANGE_TYPES.CUSTOM:
++            return isValidHours(hours) ? { type, hours } : DEFAULT_STATS_RANGE;
++        default:
++            return DEFAULT_STATS_RANGE;
++    }
++};
++
++export const saveStatsRange = (range: StatsRange) => {
++    LocalStorageHelper.setItem(STATS_RANGE_STORAGE_KEY, range);
++};
++
++// getRangeHours returns the number of hourly statistics units the range
++// covers.  The statistics are stored per clock hour, and the current hour is
++// always included, so "today" is the hours elapsed since local midnight plus
++// the current one.
++export const getRangeHours = (range: StatsRange, now: Date = new Date()): number | null => {
++    switch (range.type) {
++        case STATS_RANGE_TYPES.HOURS:
++        case STATS_RANGE_TYPES.CUSTOM:
++            return isValidHours(range.hours) ? range.hours : null;
++        case STATS_RANGE_TYPES.TODAY: {
++            const midnight = new Date(now);
++            midnight.setHours(0, 0, 0, 0);
++
++            return Math.floor((now.getTime() - midnight.getTime()) / HOUR) + 1;
++        }
++        default:
++            return null;
++    }
++};
++
++// getRecentMs returns the value of the "recent" parameter of GET /control/stats
++// for the range, or null if the full retention period should be requested.
++// retentionMs is the statistics retention period.
++export const getRecentMs = (range: StatsRange, retentionMs: number, now: Date = new Date()): number | null => {
++    const hours = getRangeHours(range, now);
++    if (hours === null || !retentionMs) {
++        return null;
++    }
++
++    const recentMs = hours * HOUR;
++
++    return recentMs >= retentionMs ? null : recentMs;
++};
++
++// isRangeAvailable returns false if the range is longer than the retention
++// period.
++export const isRangeAvailable = (range: StatsRange, retentionMs: number): boolean => {
++    if (range.type !== STATS_RANGE_TYPES.HOURS) {
++        return true;
++    }
++
++    return !retentionMs || (range.hours ?? 0) * HOUR <= retentionMs;
++};
++
++// STATS_RANGE_STRINGS are added at runtime instead of to the locale files, so
++// that the patch doesn't touch files that change in every release.  Other
++// languages fall back to these.
++const STATS_RANGE_STRINGS = {
++    stats_range_label: 'Statistics time range',
++    stats_range_default: 'Default (retention period)',
++    stats_range_today: 'Today',
++    stats_range_for_today: 'for today',
++    stats_range_custom: 'Custom',
++    stats_range_last_hours: 'Last {{count}} hour',
++    stats_range_last_hours_plural: 'Last {{count}} hours',
++    stats_range_last_days: 'Last {{count}} day',
++    stats_range_last_days_plural: 'Last {{count}} days',
++    stats_range_unit_hours: 'hours',
++    stats_range_unit_days: 'days',
++    stats_range_too_long: 'Longer than the statistics retention period',
++};
++
++let stringsAdded = false;
++
++// ensureStatsRangeStrings adds the selector's strings to the base locale.  It
++// must be called after i18next is initialized.
++export const ensureStatsRangeStrings = () => {
++    if (stringsAdded || !i18next.isInitialized) {
++        return;
++    }
++
++    [BASE_LOCALE, 'en-us'].forEach((lng) => {
++        i18next.addResourceBundle(lng, 'translation', STATS_RANGE_STRINGS, true, false);
++    });
++
++    stringsAdded = true;
++};

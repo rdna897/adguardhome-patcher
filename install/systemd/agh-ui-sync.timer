@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the patched AdGuard Home dashboard UI in sync with the installed version
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

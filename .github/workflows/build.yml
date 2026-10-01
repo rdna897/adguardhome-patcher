@@ -1,0 +1,177 @@
+# Build the patched dashboard and publish version-matched public releases.
+name: build
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'AdGuard Home tag to build (empty: latest stable)'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild even if a build or incompatibility report exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'rdna897/adguardhome-patcher' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      patch_sha: ${{ steps.pick.outputs.patch_sha }}
+      skip: ${{ steps.pick.outputs.skip }}
+      build_outcome: ${{ steps.build.outcome }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Pick release
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          FORCE_REBUILD: ${{ inputs.force }}
+        run: |
+          tag="$REQUESTED_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(git ls-remote --tags --refs https://github.com/AdguardTeam/AdGuardHome.git \
+              | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]]; then
+            echo '::error::Expected an AdGuard Home release tag such as v0.107.79'
+            exit 1
+          fi
+          patch_sha=$(git ls-files -z patch scripts install README.md LICENSE \
+            | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
+
+          existing=$(gh release view "ui-$tag" --json body --jq .body 2>/dev/null || true)
+          if [ "$FORCE_REBUILD" != 'true' ]; then
+            if grep -Fq "patch: $patch_sha" <<<"$existing"; then
+              echo "ui-$tag already built for patch $patch_sha"
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+            fi
+            # Public issues cannot impersonate reports made by this workflow.
+            if gh issue list --state open --author 'github-actions[bot]' \
+              --search "label:incompatible $tag $patch_sha in:body" \
+              --json number --jq '.[].number' | grep -q .; then
+              echo "$tag is already reported incompatible with patch $patch_sha"
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.pick.outputs.skip != 'true'
+        with:
+          node-version: 22
+
+      - name: Build and test
+        id: build
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          RELEASE_TAG: ${{ steps.pick.outputs.tag }}
+        run: scripts/build-release.sh "$RELEASE_TAG" dist
+
+      - name: Save release assets or failure reason
+        if: always() && steps.build.outcome != 'skipped' && steps.pick.outputs.tag != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dashboard-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: >-
+      always() && !cancelled() && needs.build.outputs.skip != 'true' &&
+      needs.build.outputs.tag != '' &&
+      (needs.build.outputs.build_outcome == 'success' || needs.build.outputs.build_outcome == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      PATCH_SHA: ${{ needs.build.outputs.patch_sha }}
+      BUILD_COMMIT: ${{ github.sha }}
+      BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dashboard-build
+          path: dist
+
+      - name: Publish
+        if: needs.build.result == 'success' && needs.build.outputs.build_outcome == 'success'
+        run: |
+          (cd dist && sha256sum -c agh-dashboard-range.tar.gz.sha256 \
+            && sha256sum -c agh-dashboard-range-source.tar.gz.sha256)
+          cat >release-notes.md <<EOF
+          Patched dashboard UI for AdGuard Home $RELEASE_TAG.
+
+          This is a modified frontend, not an official AdGuard Home release.
+          License: GPL-3.0. Corresponding source and build/install scripts are
+          included in agh-dashboard-range-source.tar.gz in this release.
+
+          patch: $PATCH_SHA
+          commit: $BUILD_COMMIT
+          run: $BUILD_RUN_URL
+          EOF
+          # Keep the existing release available while replacing its assets.
+          if gh release view "ui-$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "ui-$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 --clobber
+            gh release edit "ui-$RELEASE_TAG" --title "UI for $RELEASE_TAG" --notes-file release-notes.md --target "$BUILD_COMMIT"
+          else
+            gh release create "ui-$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 \
+              --title "UI for $RELEASE_TAG" --notes-file release-notes.md --target "$BUILD_COMMIT"
+          fi
+
+          for n in $(gh issue list --state open --author 'github-actions[bot]' \
+            --search "label:incompatible $RELEASE_TAG in:title" --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Resolved: ui-$RELEASE_TAG was built with patch $PATCH_SHA."
+          done
+
+      - name: Report incompatible release
+        if: needs.build.outputs.build_outcome == 'failure'
+        run: |
+          reason=$(cat dist/REASON 2>/dev/null || echo 'see the run log')
+          gh label create incompatible --color d73a4a --description 'Patch does not work on a release' --force
+          cat >issue-body.md <<EOF
+          AdGuard Home $RELEASE_TAG failed the compatibility gate: **$reason**.
+
+          Servers on $RELEASE_TAG keep the stock dashboard until the patch is updated.
+
+          tag: $RELEASE_TAG
+          patch: $PATCH_SHA
+          run: $BUILD_RUN_URL
+          EOF
+          existing=$(gh issue list --state open --author 'github-actions[bot]' \
+            --search "label:incompatible $RELEASE_TAG $PATCH_SHA in:body" --json number --jq '.[].number')
+          if [ -z "$existing" ]; then
+            gh issue create --label incompatible \
+              --title "$RELEASE_TAG: dashboard patch is not compatible" --body-file issue-body.md
+          fi
