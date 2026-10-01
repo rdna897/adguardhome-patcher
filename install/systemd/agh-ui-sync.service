@@ -1,8 +1,0 @@
-[Unit]
-Description=Install the patched AdGuard Home dashboard UI for the installed version
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/agh-ui-sync.sh

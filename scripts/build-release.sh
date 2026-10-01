@@ -5,7 +5,7 @@
 # Usage: scripts/build-release.sh <tag> [out-dir]
 #
 # On success, out-dir (default: dist) contains:
-#   agh-dashboard-range.tar.gz         build/static and build/VERSION
+#   agh-dashboard-range.tar.gz         frontend, version and revision manifest
 #   agh-dashboard-range.tar.gz.sha256
 #   agh-dashboard-range-source.tar.gz  patched source and build/install scripts
 #   agh-dashboard-range-source.tar.gz.sha256
@@ -117,6 +117,7 @@ smoke_test() {
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
 
 step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
+step "manual patcher install/update/uninstall tests" python3 "$repo_root/scripts/tests/test-patcher.py"
 
 log "building $tag with patch made against $patch_base"
 git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
@@ -163,12 +164,17 @@ echo "$tag" >"$src/build/VERSION"
 cp "$src/LICENSE.txt" "$src/build/LICENSE.txt"
 printf 'Modified AdGuard Home dashboard by adguardhome-patcher.\nUpstream: %s\nBuilt: %s\nSource: agh-dashboard-range-source.tar.gz in the same release.\n' \
 	"$tag" "$(date -u +%F)" >"$src/build/NOTICE"
-tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE
+python3 "$repo_root/scripts/release-manifest.py" "$tag" "$src/build"
+tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE build/MANIFEST.json
 (cd "$out" && sha256sum agh-dashboard-range.tar.gz >agh-dashboard-range.tar.gz.sha256)
 mkdir -p "$src/patcher"
 cp -r "$repo_root/patch" "$repo_root/scripts" "$repo_root/install" "$src/patcher/"
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$src/patcher/"
+mkdir -p "$src/patcher/docs"
+cp "$repo_root/docs/manual-updates.md" "$src/patcher/docs/"
 tar czf "$out/agh-dashboard-range-source.tar.gz" \
-	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' -C "$src" .
+	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' \
+	--exclude='*/__pycache__' --exclude='*.pyc' -C "$src" .
 (cd "$out" && sha256sum agh-dashboard-range-source.tar.gz >agh-dashboard-range-source.tar.gz.sha256)
+step "release manifest and packaged management tooling" python3 "$repo_root/scripts/release-manifest.py" --verify "$tag" "$out"
 log "$tag passed the compatibility gate"

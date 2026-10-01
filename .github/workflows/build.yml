@@ -85,8 +85,7 @@ jobs:
             echo '::error::Expected an AdGuard Home release tag such as v0.107.79'
             exit 1
           fi
-          patch_sha=$(git ls-files -z patch scripts install README.md LICENSE \
-            | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16)
+          patch_sha=$(python3 scripts/release-manifest.py)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
 
