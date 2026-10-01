@@ -97,6 +97,7 @@ class FakeRunner:
         self.unhealthy_restarts = 0
         self.mounts = []
         self.labels = {}
+        self.image_command = []
         self.version = VERSION
 
     def run(self, *args, check=True):
@@ -117,10 +118,12 @@ class FakeRunner:
                 self.running = True
         elif args[:2] == ("systemctl", "is-active"):
             code = 0 if self.running else 1
+        elif args[:3] == ("docker", "image", "inspect"):
+            stdout = json.dumps(self.image_command)
         elif args[:2] == ("docker", "inspect"):
             values = {"{{json .Mounts}}": self.mounts, "{{json .Config.Labels}}": self.labels,
                       "{{json .State}}": {"Running": self.running}}
-            stdout = json.dumps(values[args[3]])
+            stdout = "sha256:" + "a" * 64 if args[3] == "{{.Image}}" else json.dumps(values[args[3]])
         result = SimpleNamespace(returncode=code, stdout=stdout, stderr="fixture failure" if code else "")
         if check and code:
             raise p.Error("restart failed")
@@ -541,6 +544,7 @@ class ManualPatcher(unittest.TestCase):
         generated = json.loads(data)
         self.assertEqual(set(generated["services"]), {"adguardhome"})
         service = generated["services"]["adguardhome"]
+        self.assertNotIn("command", service)
         self.assertEqual(service["working_dir"], "/opt/adguardhome/ui")
         self.assertEqual(service["entrypoint"], ["/bin/sh", "/opt/adguardhome-patcher/agh-launch.sh"])
         self.assertEqual(service["environment"]["AGH_BIN"], "/opt/adguardhome/AdGuardHome")
@@ -567,6 +571,113 @@ class ManualPatcher(unittest.TestCase):
         before = self.snapshot()
         p.setup("docker", None, None, self.source, self.paths, self.runner, {})
         self.assertEqual(self.snapshot(), before)
+        self.assert_no_restart()
+
+    def compose_config(self, base, managed=False):
+        """Resolve Compose without contacting a daemon or modifying the base file."""
+        filename = self.root / "compose.yaml"
+        filename.write_text(json.dumps(base))
+        before = filename.read_bytes()
+        command = ["docker", "compose", "-f", str(filename)]
+        if managed:
+            command += ["-f", str(self.paths.docker_override)]
+        result = subprocess.run(command + ["config", "--format", "json"],
+                                check=True, capture_output=True, text=True)
+        self.assertEqual(filename.read_bytes(), before)
+        return json.loads(result.stdout)["services"]["dns"]
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
+    def test_docker_compose_preserves_base_command_and_administrator_settings(self):
+        self.runner.image_command = ["--no-check-update", "-c", "/image/config.yaml", "-w", "/image/work"]
+        tool = self.setup_docker("agh-container", "dns")
+        arguments = ["--no-check-update", "-c", "/custom/config.yaml", "-w", "/custom/work",
+                     "--extra-test-option", "argument with spaces", 'literal $HOME "quoted"']
+        base = {"services": {"dns": {
+            "image": "adguard/adguardhome:v0.107.79", "container_name": "agh-container",
+            "command": [arg.replace("$", "$$") for arg in arguments],
+            "ports": ["5353:53/udp"], "networks": ["admin-network"],
+            "volumes": [str(self.root / "conf") + ":/custom/conf", str(self.root / "work") + ":/custom/work"],
+            "environment": {"ADMIN_SETTING": "preserved"},
+            "healthcheck": {"test": ["CMD", "/opt/adguardhome/AdGuardHome", "--version"], "interval": "30s"},
+            "labels": {"org.example.admin": "preserved"}}}, "networks": {"admin-network": {}}}
+        original = self.compose_config(base)
+        effective = self.compose_config(base, managed=True)
+        for key in ("command", "container_name", "ports", "networks", "healthcheck"):
+            self.assertEqual(effective[key], original[key], key)
+        self.assertEqual([arg.replace("$$", "$") for arg in effective["command"]], arguments)
+        self.assertEqual(effective["environment"]["ADMIN_SETTING"], "preserved")
+        self.assertEqual(effective["labels"]["org.example.admin"], "preserved")
+        self.assertEqual(effective["labels"][p.DOCKER_OVERRIDE_LABEL], tool.config["docker_override_revision"])
+        for volume in original["volumes"]:
+            self.assertIn(volume, effective["volumes"])
+        self.assertNotIn("command", json.loads(self.paths.docker_override.read_text())["services"]["dns"])
+        self.assert_no_restart()
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
+    def test_docker_compose_without_command_keeps_image_arguments_as_entrypoint_fallback(self):
+        self.runner.image_command = ["-c", '/image/conf $HOME "quoted".yaml', "-w", "/image/work with spaces"]
+        self.setup_docker("agh-container", "dns")
+        base = {"services": {"dns": {"image": "adguard/adguardhome:v0.107.79"}}}
+        original = self.compose_config(base)
+        effective = self.compose_config(base, managed=True)
+        self.assertEqual(effective.get("command"), original.get("command"))
+        self.assertIsNone(effective.get("command"))
+        self.assertNotIn("command", json.loads(self.paths.docker_override.read_text())["services"]["dns"])
+        self.assertNotIn("--no-check-update", effective["entrypoint"][2])
+        self.assertEqual(self.run_launcher_entrypoint(effective, []), self.runner.image_command)
+        supplied = ["-c", "/admin/config.yaml", "-w", "/admin/work", "--verbose"]
+        self.assertEqual(self.run_launcher_entrypoint(effective, supplied), supplied)
+        self.assert_no_restart()
+
+    def run_launcher_entrypoint(self, service, arguments, patched=False):
+        """Execute the rendered entrypoint against an argv-recording fake binary."""
+        binary = self.root / "argv-binary"
+        binary.write_text('#!/usr/bin/env python3\nimport json,sys\n'
+                          'print("AdGuard Home, version v0.107.79" if sys.argv[1:] == ["--version"] '
+                          'else json.dumps(sys.argv[1:]))\n')
+        binary.chmod(0o755)
+        ui = self.root / "launcher-ui"
+        if patched:
+            (ui / "build/static").mkdir(parents=True, exist_ok=True)
+            (ui / "build/VERSION").write_text(VERSION)
+            (ui / "build/static/index.html").write_text("frontend")
+        entrypoint = [arg.replace("$$", "$") for arg in service["entrypoint"]]
+        # Use the installed launcher while keeping the test entirely in its temporary root.
+        entrypoint = [arg.replace("/opt/adguardhome-patcher/agh-launch.sh", str(self.paths.docker_launcher))
+                      for arg in entrypoint]
+        result = subprocess.run(entrypoint + arguments, check=True, capture_output=True, text=True,
+                                env={**os.environ, "AGH_BIN": str(binary), "AGH_UI_ROOT": str(ui)})
+        return json.loads(result.stdout)
+
+    def test_docker_launcher_passes_arguments_through_in_order_for_stock_and_patched_ui(self):
+        self.setup_docker()
+        service = json.loads(self.paths.docker_override.read_text())["services"]["adguardhome"]
+        args = ["-c", "/custom/config.yaml", "-w", "/custom/work", "--extra-test-option",
+                "two words", "", 'literal $HOME "quoted"']
+        self.assertEqual(self.run_launcher_entrypoint(service, args), args)
+        self.assertEqual(self.run_launcher_entrypoint(service, args, patched=True), ["--local-frontend", *args])
+        self.assert_no_restart()
+
+    def test_docker_image_command_validation_precedes_mutation(self):
+        for command in ("not-an-array", [None], ["nul\0argument"]):
+            self.runner.image_command = command
+            before = self.snapshot()
+            with self.assertRaisesRegex(p.Error, "Invalid Docker image command"):
+                self.setup_docker()
+            self.assertEqual(self.snapshot(), before)
+        self.assert_no_restart()
+
+    def test_docker_image_default_change_updates_fingerprint_and_requires_activation(self):
+        tool = self.setup_docker()
+        self.apply_docker_override()
+        old = self.paths.docker_override.read_bytes()
+        self.runner.image_command = ["-c", "/new-image/config.yaml"]
+        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        tool = p.Patcher(p.read_config(self.paths), self.paths, self.runner, self.network)
+        self.assertNotEqual(old, self.paths.docker_override.read_bytes())
+        self.assertIn("not active", tool.tooling_health())
+        self.apply_docker_override()
+        self.assertEqual(tool.tooling_health(), "Healthy")
         self.assert_no_restart()
 
     def test_docker_service_defaults_to_compose_label(self):
@@ -641,10 +752,13 @@ class ManualPatcher(unittest.TestCase):
         self.setup_docker()
         self.apply_docker_override()
         before = self.paths.docker_override.read_bytes()
+        before_stat = self.paths.docker_override.stat()
         released = self.update_released_tools(change_template=False)
         p.setup("docker", None, None, self.source, self.paths, self.runner, {})
         config = p.read_config(self.paths)
         self.assertEqual(before, self.paths.docker_override.read_bytes())
+        self.assertEqual(before_stat.st_ino, self.paths.docker_override.stat().st_ino)
+        self.assertEqual(before_stat.st_mtime_ns, self.paths.docker_override.stat().st_mtime_ns)
         self.network.tooling = released["tooling_revision"]
         tool = p.Patcher(config, self.paths, self.runner, self.network)
         self.assertEqual(tool.tooling_comparison(self.network.tooling), ("tooling up to date", None))

@@ -1,13 +1,6 @@
 {
   "services": {
     "adguardhome": {
-      "command": [
-        "--no-check-update",
-        "-c",
-        "/opt/adguardhome/conf/AdGuardHome.yaml",
-        "-w",
-        "/opt/adguardhome/work"
-      ],
       "entrypoint": [
         "/bin/sh",
         "/opt/adguardhome-patcher/agh-launch.sh"

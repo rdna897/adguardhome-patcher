@@ -65,7 +65,7 @@ agh-patcher check
 sudo agh-patcher update
 ```
 
-The installer takes `<container-name> [compose-service-name]`; the service defaults to the container's Compose label, then its container name. For different names, use e.g. `install.sh agh-container dns` and `up -d dns`. Use your actual base Compose filename. The patcher owns the override; your base file and data volumes remain administrator-owned. Keep using both files for Docker operations and preserve your ports, networking and additional command flags in the base file.
+The installer takes `<container-name> [compose-service-name]`; the service defaults to the container's Compose label, then its container name. For different names, use e.g. `install.sh agh-container dns` and `up -d dns`. Use your actual base Compose filename. The patcher owns the override; your base file and data volumes remain administrator-owned. The managed override does not replace the base service command or administrator Compose settings. Keep using both files for Docker operations.
 
 ## Update
 

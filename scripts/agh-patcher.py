@@ -269,6 +269,13 @@ def docker_override(template, config, paths):
     for mount in service["volumes"]:
         # Compose interpolates dollar signs even in JSON-form YAML scalars.
         mount["source"] = sources[mount["target"]].replace("$", "$$")
+    # Compose clears image CMD when overriding ENTRYPOINT.  Keep the image's
+    # arguments only as a fallback; any supplied service command wins unchanged.
+    if config["docker_image_command"]:
+        defaults = shlex.join(config["docker_image_command"])
+        launcher = shlex.join(service["entrypoint"])
+        script = f'if [ "$#" -eq 0 ]; then set -- {defaults}; fi; exec {launcher} "$@"'
+        service["entrypoint"] = ["/bin/sh", "-c", script.replace("$", "$$"), "agh-patcher"]
     document["services"] = {config["compose_service"]: service}
     labels = service.setdefault("labels", {})
     if not isinstance(labels, dict) or DOCKER_OVERRIDE_LABEL in labels:
@@ -315,6 +322,9 @@ def validate_config(config):
     if config["mode"] == "docker":
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config.get("compose_service", "")):
             raise Error("Invalid Compose service name")
+        if (not isinstance(config.get("docker_image_command"), list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_image_command"])):
+            raise Error("Invalid Docker image command")
         for key in ("docker_override_sha256", "docker_override_revision"):
             if not isinstance(config.get(key), str) or not re.fullmatch(REVISION, config[key]):
                 raise Error("Invalid managed Docker override identity")
@@ -853,6 +863,16 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
             raise Error("Invalid Compose service name")
         if actual_service and actual_service != config["compose_service"]:
             raise Error("Compose service name does not match the container's Compose service label")
+        image = runner.run("docker", "inspect", "--format", "{{.Image}}", config["container"]).stdout.strip()
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
+            raise Error("Invalid Docker image identity")
+        config["docker_image_command"] = json.loads(runner.run(
+            "docker", "image", "inspect", "--format", "{{json .Config.Cmd}}", image).stdout)
+        if config["docker_image_command"] is None:
+            config["docker_image_command"] = []
+        if (not isinstance(config["docker_image_command"], list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_image_command"])):
+            raise Error("Invalid Docker image command")
         override_bytes, override_revision = docker_override((source / "install/docker/compose.override.yaml").read_text(), config, paths)
         config["docker_override_sha256"] = hashlib.sha256(override_bytes).hexdigest()
         config["docker_override_revision"] = override_revision
@@ -888,7 +908,8 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
         install_file(source / "scripts/agh-launch.sh", target)
         if mode == "docker":
             durable_mkdir(patcher.ui)
-            install_bytes(override_bytes, paths.docker_override, 0o644)
+            if not paths.docker_override.exists() or paths.docker_override.read_bytes() != override_bytes:
+                install_bytes(override_bytes, paths.docker_override, 0o644)
         atomic_json(paths.config, config)
         paths.config.chmod(0o644)
         if mode == "native":
