@@ -2,6 +2,8 @@
 name: build
 
 on:
+  pull_request:
+    branches: [main]
   schedule:
     - cron: '17 */6 * * *'
   push:
@@ -21,12 +23,36 @@ permissions:
   contents: read
 
 concurrency:
-  group: build
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('pr-validation-{0}', github.event.pull_request.number) || 'build' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  pr-validation:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Validate the PR's exact source, rather than its synthetic merge commit.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Validate supported release
+        env:
+          BROWSER_TEST: '1'
+        run: scripts/build-release.sh "$(cat patch/PATCH_BASE)" dist
+
   build:
-    if: github.repository == 'rdna897/adguardhome-patcher' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'rdna897/adguardhome-patcher' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -103,7 +129,10 @@ jobs:
   publish:
     needs: build
     if: >-
-      always() && !cancelled() && needs.build.outputs.skip != 'true' &&
+      always() && !cancelled() &&
+      github.repository == 'rdna897/adguardhome-patcher' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      needs.build.outputs.skip != 'true' &&
       needs.build.outputs.tag != '' &&
       (needs.build.outputs.build_outcome == 'success' || needs.build.outputs.build_outcome == 'failure')
     runs-on: ubuntu-latest

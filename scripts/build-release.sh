@@ -12,7 +12,7 @@
 # On failure, it exits non-zero and writes the reason to out-dir/REASON.
 #
 # Gate: the stats API still documents "recent", the patch applies (three-way
-# against PATCH_BASE), typecheck, eslint on the patched files, unit tests,
+# against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
 # production build, and a smoke test that runs the official binary of the
 # release with the patched UI.  Set SMOKE_TEST=0 to skip the last step.
 
@@ -27,6 +27,7 @@ patch_file="$repo_root/patch/dashboard-range.patch"
 patch_base=$(cat "$repo_root/patch/PATCH_BASE")
 REPO_URL=${REPO_URL:-https://github.com/AdguardTeam/AdGuardHome.git}
 SMOKE_TEST=${SMOKE_TEST:-1}
+BROWSER_TEST=${BROWSER_TEST:-0}
 
 SUDO=
 if [ "$(id -u)" != 0 ]; then
@@ -65,7 +66,8 @@ host_arch() {
 }
 
 # smoke_test starts the official binary of the release with the patched UI and
-# checks that the UI is served and that the stats API accepts "recent".
+# checks that the UI is served, stats accepts "recent", and Query Log supports
+# the existing filtered, limited requests used for live frontend polling.
 smoke_test() {
 	local dir="$work/smoke" arch port pid ok=1 i
 	arch=$(host_arch) || { echo "unsupported architecture, skipping"; return 0; }
@@ -99,6 +101,7 @@ smoke_test() {
 			-d '{"name":"smoke","password":"smoke-test-password"}' \
 			&& curl -fsS -b "$dir/cj" "$base/" | grep -q "$main_js" \
 			&& curl -fsS -b "$dir/cj" "$base/control/stats?recent=3600000" | grep -q num_dns_queries \
+			&& curl -fsS -b "$dir/cj" "$base/control/querylog?limit=100&search=smoke&response_status=all" | grep -q '"data"' \
 			&& ok=0
 	fi
 
@@ -113,11 +116,16 @@ smoke_test() {
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
 
+step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
+
 log "building $tag with patch made against $patch_base"
 git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetch the $tag source"
 
 grep -q "'name': 'recent'" "$src/openapi/openapi.yaml" \
 	|| fail "the stats API no longer documents the 'recent' parameter"
+
+grep -q "'/querylog':" "$src/openapi/openapi.yaml" \
+    || fail "the release no longer documents the Query Log API"
 
 # The base release lets git do a three-way merge when surrounding code moved.
 git -C "$src" fetch -q --depth 1 origin tag "$patch_base" || true
@@ -126,6 +134,9 @@ git -C "$src" apply --3way --whitespace=nowarn "$patch_file" >&2 \
 if git -C "$src" diff --name-only --diff-filter=U | grep -q .; then
 	fail "the patch has merge conflicts"
 fi
+
+# --3way stages the applied patch; checking only the working diff misses it.
+step "applied-source whitespace" "$repo_root/scripts/check-applied-whitespace.sh" "$src"
 
 mapfile -t ts_files < <(grep '^+++ b/client/' "$patch_file" | sed 's#^+++ b/client/##' | grep -E '\.tsx?$')
 
@@ -136,6 +147,13 @@ step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
 step "unit tests" npx vitest --run
 step "production build" npm run build-prod
 [ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
+
+if [ "$BROWSER_TEST" = 1 ]; then
+	if [ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]; then
+		step "install Chromium for browser checks" npx playwright install --with-deps chromium --only-shell
+	fi
+	step "Live Query Log browser checks" node "$repo_root/scripts/tests/live-query-log-browser.cjs" "$src"
+fi
 
 if [ "$SMOKE_TEST" = 1 ]; then
 	step "smoke test against the official $tag binary" smoke_test

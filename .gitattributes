@@ -1,0 +1,3 @@
+# Blank unified-patch context lines require a space; keep other whitespace checks.
+# The build gate checks staged and unstaged applied source with all three rules.
+patch/dashboard-range.patch whitespace=-blank-at-eol
