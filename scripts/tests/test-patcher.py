@@ -670,19 +670,41 @@ class ManualPatcher(unittest.TestCase):
             self.assertEqual(self.snapshot(), before)
         self.assert_no_restart()
 
-    def test_docker_base_command_change_updates_fingerprint_and_requires_activation(self):
-        tool = self.setup_docker()
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
+    def test_docker_base_command_change_to_empty_requires_base_reinstall_and_activation(self):
+        initial_command = ["-c", "/old-base/config.yaml", "-w", "/old-base/work"]
+        self.runner.effective_command = initial_command
+        tool = self.setup_docker("agh-container", "dns")
         self.apply_docker_override()
         old = self.paths.docker_override.read_bytes()
+        image_id = tool.config["docker_image_id"]
+        self.runner.effective_command = []
+        # With the managed entrypoint still active, zero arguments use the old
+        # fallback. Command changes therefore require the base-only lifecycle.
+        service = json.loads(old)["services"]["dns"]
+        self.assertEqual(self.run_launcher_entrypoint(service, []), initial_command)
+        base = {"services": {"dns": {"image": "adguard/adguardhome:v0.107.79", "command": []}}}
+        base_service = self.compose_config(base)
+        self.assertEqual(base_service["command"], [])
+        self.assertIsNone(base_service.get("entrypoint"))
+        # Model recreation with only the base file: no managed label or mounts.
         self.runner.labels.pop(p.DOCKER_OVERRIDE_LABEL)
-        self.runner.effective_command = ["-c", "/new-base/config.yaml"]
+        self.runner.mounts = []
         p.setup("docker", None, None, self.source, self.paths, self.runner, {})
         tool = p.Patcher(p.read_config(self.paths), self.paths, self.runner, self.network)
+        self.assertEqual(tool.config["docker_effective_command"], [])
+        self.assertEqual(tool.config["docker_image_id"], image_id)
         self.assertNotEqual(old, self.paths.docker_override.read_bytes())
+        self.assertEqual(json.loads(self.paths.docker_override.read_text())["services"]["dns"]["entrypoint"],
+                         ["/bin/sh", "/opt/adguardhome-patcher/agh-launch.sh"])
         self.assertIn("not active", tool.tooling_health())
         self.apply_docker_override()
+        effective = self.compose_config(base, managed=True)
+        self.assertEqual(effective["command"], [])
+        self.assertEqual(self.run_launcher_entrypoint(effective, []), [])
         self.assertEqual(tool.tooling_health(), "Healthy")
         self.assert_no_restart()
+        self.assertFalse(any(call[:2] == ("docker", "compose") for call in self.runner.calls))
 
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
     def test_docker_explicit_empty_base_command_keeps_empty_fallback(self):
