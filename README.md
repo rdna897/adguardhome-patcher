@@ -4,7 +4,15 @@
 
 Add a time range selector to the AdGuard Home dashboard: **Default**, **Last 1 / 6 / 12 / 24 hours**, **Today**, **Last 7 days**, **Last 30 days**, and **Custom** hours or days. The selection stays in your browser. Phone screens use a compact two-column chart layout.
 
-![Custom 13 hours](docs/custom13h.png)
+The screenshots show a custom 13-hour range with sample statistics. `google.com` and `microsoft.com` are the example blocked domains.
+
+**Desktop**
+
+![Desktop dashboard with a custom 13-hour range and example blocked domains](docs/dashboard-desktop.png)
+
+**Mobile**
+
+<img src="docs/dashboard-mobile.png" alt="Mobile dashboard with two-column charts and example blocked domains" width="390">
 
 The patch runs with the official AdGuard Home binary or Docker image. It changes the frontend only; your configuration, statistics database, and query log stay intact.
 
