@@ -95,9 +95,11 @@ jobs:
           echo "frontend_input_sha=$frontend_input_sha" >> "$GITHUB_OUTPUT"
           echo "tooling_sha=$tooling_sha" >> "$GITHUB_OUTPUT"
 
-          existing=$(gh release view "ui-$tag" --json body --jq .body 2>/dev/null || true)
+          existing=$(gh release view "ui-$tag" --json body,assets 2>/dev/null || echo '{}')
+          body=$(jq -r '.body // ""' <<<"$existing")
           if [ "$FORCE_REBUILD" != 'true' ]; then
-            if grep -Fxq "frontend-input: $frontend_input_sha" <<<"$existing" && grep -Fxq "tooling: $tooling_sha" <<<"$existing"; then
+            if grep -Fxq "frontend-input: $frontend_input_sha" <<<"$body" && grep -Fxq "tooling: $tooling_sha" <<<"$body" && \
+              jq -e '[.assets[].name] | contains(["agh-patcher-tools.tar.gz", "agh-patcher-tools.tar.gz.sha256", "agh-dashboard-range.tar.gz", "agh-dashboard-range.tar.gz.sha256", "agh-dashboard-range-source.tar.gz", "agh-dashboard-range-source.tar.gz.sha256"])' <<<"$existing" >/dev/null; then
               echo "ui-$tag already built from frontend inputs $frontend_input_sha and tooling $tooling_sha"
               echo 'skip=true' >> "$GITHUB_OUTPUT"
             fi
@@ -174,15 +176,25 @@ jobs:
         if: needs.build.result == 'success' && needs.build.outputs.build_outcome == 'success'
         run: |
           (cd dist && sha256sum -c agh-dashboard-range.tar.gz.sha256 \
-            && sha256sum -c agh-dashboard-range-source.tar.gz.sha256)
+            && sha256sum -c agh-dashboard-range-source.tar.gz.sha256 \
+            && sha256sum -c agh-patcher-tools.tar.gz.sha256)
           # The release notes must name exactly the frontend revision in the archive.
           manifest_sha=$(tar -xzOf dist/agh-dashboard-range.tar.gz build/MANIFEST.json | jq -r .patch_revision)
           if [[ ! "$PATCH_SHA" =~ ^[a-f0-9]{64}$ ]] || [ "$manifest_sha" != "$PATCH_SHA" ]; then
             echo '::error::Verified frontend artefact revision does not match the archive manifest'
             exit 1
           fi
+          tools_manifest=$(tar -xzOf dist/agh-patcher-tools.tar.gz TOOLS.json)
+          if [ "$(jq -r .tooling_revision <<<"$tools_manifest")" != "$TOOLING_SHA" ] || \
+             [ "$(jq -r .adguard_version <<<"$tools_manifest")" != "$RELEASE_TAG" ]; then
+            echo '::error::Released installer tooling does not match the release identity/version'
+            exit 1
+          fi
           cat >release-notes.md <<EOF
           Patched dashboard UI for AdGuard Home $RELEASE_TAG.
+
+          Install with agh-patcher-tools.tar.gz and its SHA-256 checksum.
+          The frontend is agh-dashboard-range.tar.gz; the source archive is for development/source distribution.
 
           This is a modified frontend, not an official AdGuard Home release.
           License: GPL-3.0. Corresponding source and build/install scripts are
