@@ -2,7 +2,7 @@
 
 [![build](https://github.com/rdna897/adguardhome-patcher/actions/workflows/build.yml/badge.svg)](https://github.com/rdna897/adguardhome-patcher/actions/workflows/build.yml)
 
-Add a time range selector to the AdGuard Home dashboard: **Default**, **Last 1 / 6 / 12 / 24 hours**, **Today**, **Last 7 days**, **Last 30 days**, and **Custom** hours or days. The selection stays in your browser. Phone screens use a compact two-column chart layout.
+Add a time range selector to the AdGuard Home dashboard: **Default**, **Last 1 / 6 / 12 / 24 hours**, **Today**, **Last 7 days**, **Last 30 days**, and **Custom** hours or days. The selection stays in your browser. Phone screens use a compact two-column chart layout. The existing Query Log also gains a **Live / Paused** troubleshooting mode.
 
 The screenshots show a custom 13-hour range with sample statistics. `google.com` and `microsoft.com` are the example blocked domains.
 
@@ -176,6 +176,16 @@ Your work and configuration volumes are retained. The host UI and launcher files
 - Ranges longer than your statistics retention setting are disabled.
 - Absolute start/end ranges require backend changes and are not included.
 - The range selector uses English strings added at runtime.
+
+## Live Query Log
+
+On the existing Query Log page, click **Paused** to enable **Live**, or click **Live** to pause. The preference stays in this browser, and the existing domain/client search and status filters continue to apply.
+
+Live mode polls the existing Query Log API about once per second after each completed request; it uses no WebSocket, backend push stream, or modified AdGuard Home binary. Hidden tabs suspend polling. Failed requests keep the displayed entries and retry after five seconds.
+
+While you are reading older rows, arrivals wait behind a **new queries ↑** button. Click it to return to the newest entries; scrolling back to the top also reveals them. The browser keeps at most **500 displayed rows and 500 queued arrivals**, without changing server storage. **Clear view** clears only this browser view, keeping the server query log intact. Use Refresh to reload the saved log.
+
+Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long requests completing outside the retained time window, or time spent in a hidden tab can leave gaps in this troubleshooting view; the server log remains available through the normal paused/Refresh view. Added control labels fall back to English, like the dashboard range selector.
 
 ## Building and changing the patch
 

@@ -65,7 +65,8 @@ host_arch() {
 }
 
 # smoke_test starts the official binary of the release with the patched UI and
-# checks that the UI is served and that the stats API accepts "recent".
+# checks that the UI is served, stats accepts "recent", and Query Log supports
+# the existing filtered, limited requests used for live frontend polling.
 smoke_test() {
 	local dir="$work/smoke" arch port pid ok=1 i
 	arch=$(host_arch) || { echo "unsupported architecture, skipping"; return 0; }
@@ -99,6 +100,7 @@ smoke_test() {
 			-d '{"name":"smoke","password":"smoke-test-password"}' \
 			&& curl -fsS -b "$dir/cj" "$base/" | grep -q "$main_js" \
 			&& curl -fsS -b "$dir/cj" "$base/control/stats?recent=3600000" | grep -q num_dns_queries \
+			&& curl -fsS -b "$dir/cj" "$base/control/querylog?limit=100&search=smoke&response_status=all" | grep -q '"data"' \
 			&& ok=0
 	fi
 
@@ -118,6 +120,9 @@ git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src" || fail "couldn't fetc
 
 grep -q "'name': 'recent'" "$src/openapi/openapi.yaml" \
 	|| fail "the stats API no longer documents the 'recent' parameter"
+
+grep -q "'/querylog':" "$src/openapi/openapi.yaml" \
+    || fail "the release no longer documents the Query Log API"
 
 # The base release lets git do a three-way merge when surrounding code moved.
 git -C "$src" fetch -q --depth 1 origin tag "$patch_base" || true
