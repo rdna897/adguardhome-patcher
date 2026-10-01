@@ -5,6 +5,8 @@
 # Usage: scripts/build-release.sh <tag> [out-dir]
 #
 # On success, out-dir (default: dist) contains:
+#   agh-patcher-tools.tar.gz           released installer and manual CLI
+#   agh-patcher-tools.tar.gz.sha256
 #   agh-dashboard-range.tar.gz         frontend, version and revision manifest
 #   agh-dashboard-range.tar.gz.sha256
 #   agh-dashboard-range-source.tar.gz  patched source and build/install scripts
@@ -119,7 +121,7 @@ smoke_test() {
 	return "$ok"
 }
 
-rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
+rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz* "$out"/agh-patcher-tools.tar.gz*
 
 # Never reuse or delete a directory this run did not create.
 mkdir "$src" 2>/dev/null \
@@ -179,11 +181,12 @@ frontend_revision=$(python3 "$repo_root/scripts/release-manifest.py" "$tag" "$sr
 log "frontend artefact revision: $frontend_revision"
 tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE build/MANIFEST.json
 (cd "$out" && sha256sum agh-dashboard-range.tar.gz >agh-dashboard-range.tar.gz.sha256)
+step "package released installer tools" python3 "$repo_root/scripts/release-manifest.py" --tools "$tag" "$out"
 mkdir -p "$src/patcher"
 cp -r "$repo_root/patch" "$repo_root/scripts" "$repo_root/install" "$src/patcher/"
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$src/patcher/"
 mkdir -p "$src/patcher/docs"
-cp "$repo_root/docs/manual-updates.md" "$src/patcher/docs/"
+cp "$repo_root"/docs/*.md "$src/patcher/docs/"
 mkdir -p "$src/patcher/.github/workflows"
 cp "$repo_root/.github/workflows/build.yml" "$src/patcher/.github/workflows/"
 tar czf "$out/agh-dashboard-range-source.tar.gz" \

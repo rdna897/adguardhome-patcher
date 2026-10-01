@@ -32,7 +32,8 @@ REVISION = r"[a-f0-9]{64}"
 # patch_revision/"patch:" identify the built frontend bytes under build/static.
 FRONTEND_REVISION_ALGORITHM = "agh-frontend-static-sha256-v1"
 NOT_CHECKED = "Unknown (run agh-patcher check)"
-TOOLING_UPDATE = "Download the current patcher source and rerun its installer to update management tooling."
+TOOLING_UPDATE = "Download and verify the tools bundle from the compatible GitHub Release, then rerun its installer."
+DOCKER_OVERRIDE_LABEL = "io.github.rdna897.agh-patcher.override-revision"
 
 
 class Error(Exception):
@@ -49,9 +50,8 @@ class Paths:
         self.state = root / "var/lib/agh-patcher"
         self.systemd = root / "etc/systemd/system"
         self.command = root / "usr/local/bin/agh-patcher"
-        self.legacy_config = root / "etc/default/agh-ui-sync"
-        self.legacy_command = root / "usr/local/bin/agh-ui-sync.sh"
         self.docker_launcher = root / "usr/local/lib/adguardhome-patcher/agh-launch.sh"
+        self.docker_override = root / "opt/adguardhome-patcher/compose.patcher.yaml"
 
 
 class Runner:
@@ -232,21 +232,57 @@ def frontend_artifact_revision(static):
     return artifact_revision(frontend_static_hashes(static))
 
 
-def install_file(source, target):
+def install_bytes(data, target, mode=0o755):
     if target.is_symlink():
         raise Error(f"Refusing a symlinked tooling target: {target}")
     durable_mkdir(target.parent)
     descriptor, name = tempfile.mkstemp(prefix=".agh-patcher-tool-", dir=target.parent)
     temporary = Path(name)
     try:
-        with os.fdopen(descriptor, "wb") as out, source.open("rb") as original:
-            os.fchmod(out.fileno(), 0o755)
-            shutil.copyfileobj(original, out)
+        with os.fdopen(descriptor, "wb") as out:
+            os.fchmod(out.fileno(), mode)
+            out.write(data)
             out.flush()
             os.fsync(out.fileno())
         durable_replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def install_file(source, target):
+    install_bytes(source.read_bytes(), target)
+
+
+def docker_override(template, config, paths):
+    """Render a JSON-form YAML override without shell substitution or a YAML dependency."""
+    document = json.loads(template)
+    if (not isinstance(document, dict) or set(document) != {"services"}
+            or not isinstance(document["services"], dict) or len(document["services"]) != 1):
+        raise Error("Invalid released Docker override template")
+    service = next(iter(document["services"].values()))
+    if not isinstance(service, dict) or not isinstance(service.get("volumes"), list):
+        raise Error("Invalid released Docker service template")
+    sources = {"/opt/adguardhome/ui": config["ui_root"],
+               "/opt/adguardhome-patcher/agh-launch.sh": str(paths.docker_launcher)}
+    if {mount.get("target") for mount in service["volumes"]} != set(sources) or len(service["volumes"]) != 2:
+        raise Error("Invalid released Docker mounts")
+    for mount in service["volumes"]:
+        # Compose interpolates dollar signs even in JSON-form YAML scalars.
+        mount["source"] = sources[mount["target"]].replace("$", "$$")
+    # Compose clears image CMD when overriding ENTRYPOINT.  Keep the base
+    # container's effective arguments as fallback; supplied service commands win.
+    if config["docker_effective_command"]:
+        defaults = shlex.join(config["docker_effective_command"])
+        launcher = shlex.join(service["entrypoint"])
+        script = f'if [ "$#" -eq 0 ]; then set -- {defaults}; fi; exec {launcher} "$@"'
+        service["entrypoint"] = ["/bin/sh", "-c", script.replace("$", "$$"), "agh-patcher"]
+    document["services"] = {config["compose_service"]: service}
+    labels = service.setdefault("labels", {})
+    if not isinstance(labels, dict) or DOCKER_OVERRIDE_LABEL in labels:
+        raise Error("Invalid released Docker labels")
+    revision = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    labels[DOCKER_OVERRIDE_LABEL] = revision
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(), revision
 
 
 def safe_directory(path):
@@ -272,6 +308,10 @@ def validate_config(config):
         raise Error("Invalid patcher configuration")
     if config.get("schema") != 1 or config.get("mode") not in ("native", "docker"):
         raise Error("Unsupported patcher configuration")
+    if not isinstance(config.get("tooling_revision"), str) or not re.fullmatch(REVISION, config["tooling_revision"]):
+        raise Error("Invalid installed tooling revision; rerun the released installer")
+    if not isinstance(config.get("source_commit"), str) or not re.fullmatch(r"[a-f0-9]{40}", config["source_commit"]):
+        raise Error("Invalid released source commit")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", config.get("repository", "")):
         raise Error("Expected a public GitHub owner/repository")
     safe_directory(Path(config["ui_root"]))
@@ -279,6 +319,17 @@ def validate_config(config):
         safe_directory(Path(config["agh_dir"]))
     elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config.get("container", "")):
         raise Error("Invalid Docker container name")
+    if config["mode"] == "docker":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config.get("compose_service", "")):
+            raise Error("Invalid Compose service name")
+        if not isinstance(config.get("docker_image_id"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", config["docker_image_id"]):
+            raise Error("Invalid Docker image identity")
+        if (not isinstance(config.get("docker_effective_command"), list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_effective_command"])):
+            raise Error("Invalid Docker effective command")
+        for key in ("docker_override_sha256", "docker_override_revision"):
+            if not isinstance(config.get(key), str) or not re.fullmatch(REVISION, config[key]):
+                raise Error("Invalid managed Docker override identity")
 
 
 class IndexAssets(HTMLParser):
@@ -376,6 +427,33 @@ class Patcher:
         self.ui = Path(config["ui_root"])
         self.build = self.ui / "build"
 
+    def recovery_url(self):
+        return (f"https://github.com/{self.config['repository']}/blob/{self.config['source_commit']}/"
+                "docs/safety-and-recovery.md#interrupted-updates")
+
+    def compose_action(self):
+        return (f"sudo docker compose -f compose.yaml -f {shlex.quote(str(self.paths.docker_override))} "
+                f"up -d {shlex.quote(self.config['compose_service'])}")
+
+    def tooling_health(self):
+        if self.config["mode"] != "docker":
+            return "Healthy"
+        try:
+            override = self.paths.docker_override
+            safe_directory(override.parent)
+            if override.is_symlink() or not override.is_file() or digest(override) != self.config["docker_override_sha256"]:
+                return "Managed Docker override missing or modified; rerun the released Docker installer"
+            image = self.runner.run("docker", "inspect", "--format", "{{.Image}}", self.config["container"]).stdout.strip()
+            if image != self.config["docker_image_id"]:
+                return "Managed Docker override is stale for the current image; rerun the released Docker installer and reapply the override"
+            labels = json.loads(self.runner.run("docker", "inspect", "--format", "{{json .Config.Labels}}",
+                                               self.config["container"]).stdout) or {}
+            if not isinstance(labels, dict) or labels.get(DOCKER_OVERRIDE_LABEL) != self.config["docker_override_revision"]:
+                return "Managed Docker override not active; apply it with Compose"
+            return "Healthy"
+        except (OSError, ValueError, Error) as error:
+            return f"Cannot verify managed Docker override: {error}"
+
     def version(self):
         if self.config["mode"] == "native":
             if self.paths.root == Path("/"):
@@ -397,17 +475,14 @@ class Patcher:
             return "none", "No patched frontend installed"
         manifest_path = self.build / "MANIFEST.json"
         if not manifest_path.is_file():
-            sha = self.build / "SHA256"
-            value = sha.read_text().strip() if sha.is_file() else ""
-            revision = "legacy:" + value if re.fullmatch(REVISION, value) else "unknown"
-            if not (self.build / "static/index.html").is_file():
-                return revision, "Missing patched frontend index"
-            return revision, "Legacy frontend; update required for manifest verification"
+            return "unknown", "Missing frontend manifest"
         try:
             manifest = json.loads(manifest_path.read_text())
             recorded = manifest["patch_revision"]
             if manifest.get("schema") != 1 or not re.fullmatch(REVISION, recorded):
                 raise ValueError("Invalid manifest revision")
+            if manifest.get("revision_algorithm") != FRONTEND_REVISION_ALGORITHM:
+                raise ValueError("Invalid frontend revision algorithm")
             if (manifest["adguard_version"] != version or (self.build / "VERSION").read_text().strip() != version):
                 return recorded, "Installed patch is incompatible; launcher uses stock UI"
             if (self.build / "DISABLED").exists():
@@ -432,7 +507,7 @@ class Patcher:
                 return recorded, f"Unexpected frontend file: {extra[0]}"
             # The installed identity is always derived from the installed bytes.
             revision = artifact_revision(actual)
-            if manifest.get("revision_algorithm") == FRONTEND_REVISION_ALGORITHM and revision != recorded:
+            if revision != recorded:
                 return recorded, "Frontend manifest revision does not match its installed files"
             return revision, "Healthy"
         except (OSError, KeyError, ValueError, TypeError, Error) as error:
@@ -447,10 +522,12 @@ class Patcher:
             raise Error("Malformed release metadata")
         if metadata.get("tag_name") != tag or metadata.get("draft"):
             raise Error("Release metadata does not explicitly support the installed AdGuard Home version")
-        match = re.search(r"^patch: ([a-f0-9]{64}|[a-f0-9]{16})$", metadata.get("body", ""), re.M)
+        match = re.search(r"^patch: ([a-f0-9]{64})$", metadata.get("body", ""), re.M)
         if not match:
             raise Error("Release has no explicit patch revision; rebuild it with current tooling")
         tooling = re.search(r"^tooling: ([a-f0-9]{64})$", metadata["body"], re.M)
+        if not tooling:
+            raise Error("Release has no tooling revision")
         urls = {}
         for name in (ASSET, ASSET + ".sha256"):
             assets = [asset for asset in metadata["assets"] if isinstance(asset, dict) and asset.get("name") == name]
@@ -458,19 +535,18 @@ class Patcher:
             if len(assets) != 1 or assets[0].get("browser_download_url") != expected:
                 raise Error(f"Missing or unexpected release asset: {name}")
             urls[name] = expected
-        return Release(match.group(1), tooling.group(1) if tooling else None, urls)
+        return Release(match.group(1), tooling.group(1), urls)
 
     def tooling_comparison(self, available):
         """Describe management tooling separately; it never selects a frontend update."""
-        installed = self.config.get("tooling_revision")
-        if available is None:
-            return "tooling revision not published by this release", None
-        if installed is None:
-            return ("installed tooling unknown (configuration predates tooling identity)",
-                    "Download the current patcher source and rerun its installer to record and update management tooling.")
-        if installed == available:
-            return "tooling up to date", None
-        return "tooling update available", TOOLING_UPDATE
+        installed = self.config["tooling_revision"]
+        health = self.tooling_health()
+        if installed != available:
+            suffix = "; " + health if health != "Healthy" else ""
+            return "tooling update available" + suffix, TOOLING_UPDATE
+        if health != "Healthy":
+            return health, f"Rerun the released Docker installer if needed, then run {self.compose_action()} (use your base Compose filename)."
+        return "tooling up to date", None
 
     def status(self, remote=False):
         version = self.version()
@@ -478,6 +554,10 @@ class Patcher:
         available = available_tooling = NOT_CHECKED
         status = "Installed; availability not checked" if health == "Healthy" else health
         actions = []
+        if not remote:
+            tooling_health = self.tooling_health()
+            if tooling_health != "Healthy":
+                status += "; " + tooling_health
         if remote:
             try:
                 release = self.available(version)
@@ -485,7 +565,7 @@ class Patcher:
                 self.print_status(version, revision, "Unavailable", "Unavailable", str(error))
                 raise
             available = release.frontend
-            available_tooling = release.tooling or "Not published by this release"
+            available_tooling = release.tooling
             if revision == available and health == "Healthy":
                 status = "Frontend up to date"
             else:
@@ -499,12 +579,11 @@ class Patcher:
                 actions.append(tooling_action)
         if (self.paths.state / "transaction.json").exists():
             status += "; interrupted update (retained backup requires recovery)"
-        if (self.paths.systemd / "agh-ui-sync.timer").exists() or (self.paths.systemd / "agh-ui-sync.service").exists():
-            status += "; legacy updater artefacts present — rerun installer to disable/remove them"
+            actions.append("Recovery instructions: " + self.recovery_url())
         self.print_status(version, revision, available, available_tooling, status, actions)
 
     def print_status(self, version, revision, available, available_tooling, status, actions=()):
-        tooling = self.config.get("tooling_revision", "Unknown (configuration predates tooling identity; rerun installer)")
+        tooling = self.config["tooling_revision"]
         rows = [("AdGuard Home", version), ("Frontend revision", revision), ("Available frontend", available),
                 ("Tooling revision", tooling), ("Available tooling", available_tooling), ("Status", status),
                 *(("Next action", action) for action in actions)]
@@ -519,8 +598,8 @@ class Patcher:
             secure_path(self.paths.systemd)
             secure_path(self.paths.command)
             secure_path(self.paths.docker_launcher)
-            secure_path(self.paths.legacy_config.parent)
-            secure_path(self.paths.legacy_command.parent)
+            if self.config["mode"] == "docker":
+                secure_path(self.paths.docker_override)
         durable_mkdir(self.paths.state)
         if (self.paths.state / "lock").is_symlink():
             raise Error("Refusing a symlinked operation lock")
@@ -561,30 +640,13 @@ class Patcher:
             # Reported only: update installs frontend files, never host management tooling.
             print(f"Note: {tooling_status}. {tooling_action}")
         if (self.paths.state / "transaction.json").exists():
-            raise Error("An interrupted update has a retained backup; recover it before another update (see docs/manual-updates.md)")
+            raise Error("An interrupted update has retained recovery material. See recovery instructions: " + self.recovery_url())
         if previous == revision and health == "Healthy":
-            legacy = self.paths.legacy_command.exists() or self.paths.legacy_config.exists()
-            for unit in ("agh-ui-sync.timer", "agh-ui-sync.service"):
-                result = self.runner.run("systemctl", "show", "--property=LoadState", "--value", unit, check=False)
-                legacy = legacy or (self.paths.systemd / unit).exists() or result.stdout.strip() not in ("", "not-found")
-            if legacy:
-                print(f"Frontend is up to date: {revision}. Legacy automatic updater cleanup is required.\n"
-                      "This will disable/remove its timer, service, script and settings; the frontend will not be replaced or restarted.")
-                if not yes and not self.confirm("Type yes to disable legacy automatic updates: "):
-                    print("Cleanup declined. No installation or services changed.")
-                    return
-                with self.lock():
-                    if self.paths.root == Path("/") and read_config(self.paths) != self.config:
-                        raise Error("Patcher configuration changed during preflight; run update again")
-                    if self.version() != version or self.local(version) != (previous, health):
-                        raise Error("Installation changed during preflight; run update again")
-                    retire_legacy(self.paths, self.runner)
-                return
             print(f"Up to date: {revision}. No files/services changed.")
             return
-        if not re.fullmatch(REVISION, revision):
-            raise Error("Legacy release has no verified manifest revision; rebuild it with current release tooling")
         if self.config["mode"] == "docker":
+            if self.tooling_health() != "Healthy":
+                raise Error("Apply the verified managed Docker override before updating: " + self.compose_action())
             mounts = json.loads(self.runner.run("docker", "inspect", "--format", "{{json .Mounts}}", self.config["container"]).stdout)
             if not any(mount.get("Destination") == "/opt/adguardhome/ui" and Path(mount.get("Source", "")) == self.ui for mount in mounts):
                 raise Error("Apply the Docker dashboard override with the configured parent UI mount before updating")
@@ -604,7 +666,7 @@ class Patcher:
             print(f"AdGuard Home {version}: replace frontend {previous} with {revision}.\n"
                   f"Validated compatibility, archive checksum and all frontend files.\n"
                   f"Destination: {self.build}\nAdGuard Home will restart; configuration/data are kept.\n"
-                  "Any legacy automatic updater will be disabled. Previous files will be retained for rollback.")
+                  "Previous files will be retained for rollback.")
             if not yes and not self.confirm("Type yes to apply this update: "):
                 print("Update declined. No installation or services changed.")
                 return
@@ -614,7 +676,6 @@ class Patcher:
                 # Recheck after user think-time/locking; do not race a binary or patch change.
                 if self.version() != version or self.local(version) != (previous, health):
                     raise Error("Installation changed during preflight; run update again")
-                retire_legacy(self.paths, self.runner)
                 self.install_verified(extracted / "build", manifest, archive_sha)
 
     def install_verified(self, verified, manifest, archive_sha):
@@ -686,7 +747,7 @@ class Patcher:
                     durable_remove(journal)
             except BaseException as recovery:
                 raise Error(f"Update failed ({error}); recovery needs administrator attention ({recovery}). "
-                            f"Inspect transaction/recovery paths: {journal}") from error
+                            f"Inspect transaction/recovery paths: {journal}. Recovery instructions: {self.recovery_url()}") from error
             raise Error(f"Update failed; previous frontend restored (or stock UI retained): {error}") from error
         old_backup = previous_record.get("backup")
         if old_backup:
@@ -701,25 +762,30 @@ class Patcher:
             mounts = json.loads(self.runner.run("docker", "inspect", "--format", "{{json .Mounts}}", self.config["container"]).stdout)
             if any(mount.get("Destination") in ("/opt/adguardhome/ui", "/opt/adguardhome-patcher/agh-launch.sh") for mount in mounts):
                 raise Error("Recreate the Docker container with its base Compose file only before uninstalling")
+            safe_directory(self.paths.docker_override.parent)
+            if self.paths.docker_override.is_symlink() or (self.paths.docker_override.exists() and not self.paths.docker_override.is_file()):
+                raise Error("Refusing an unsafe managed Docker override")
         if not yes and not self.confirm("Type yes to uninstall: "):
             print("Uninstall declined. No installation or services changed.")
             return
         with self.lock():
-            retire_legacy(self.paths, self.runner)
-            override = self.paths.systemd / (UNIT + ".d/dashboard-range.conf")
-            override.unlink(missing_ok=True)
-            try:
-                override.parent.rmdir()
-            except OSError:
-                pass
+            if self.config["mode"] == "docker":
+                mounts = json.loads(self.runner.run("docker", "inspect", "--format", "{{json .Mounts}}", self.config["container"]).stdout)
+                if any(mount.get("Destination") in ("/opt/adguardhome/ui", "/opt/adguardhome-patcher/agh-launch.sh") for mount in mounts):
+                    raise Error("Recreate the Docker container with its base Compose file only before uninstalling")
             if self.config["mode"] == "native":
+                override = self.paths.systemd / (UNIT + ".d/dashboard-range.conf")
+                override.unlink(missing_ok=True)
+                try:
+                    override.parent.rmdir()
+                except OSError:
+                    pass
                 (Path(self.config["agh_dir"]) / "agh-launch.sh").unlink(missing_ok=True)
                 self.runner.run("systemctl", "daemon-reload")
                 self.restart_and_verify()
             if self.build.is_symlink():
                 raise Error("Refusing removal of a symlinked frontend")
-            owned = ((self.build / "INSTALL.json").is_file()
-                     or ((self.build / "SHA256").is_file() and (self.build / "VERSION").is_file()))
+            owned = (self.build / "INSTALL.json").is_file()
             if owned:
                 shutil.rmtree(self.build)
             elif self.build.exists():
@@ -734,6 +800,11 @@ class Patcher:
                         remove_recorded_backup(Path(data["stage"]), self.ui, ".agh-patcher-stage-")
             self.paths.command.unlink(missing_ok=True)
             self.paths.docker_launcher.unlink(missing_ok=True)
+            if self.config["mode"] == "docker":
+                if self.paths.docker_override.is_file() and digest(self.paths.docker_override) == self.config["docker_override_sha256"]:
+                    durable_remove(self.paths.docker_override)
+                elif self.paths.docker_override.exists():
+                    print(f"Modified override retained: {self.paths.docker_override}")
             shutil.rmtree(self.paths.state)
             if self.paths.config.parent.exists():
                 shutil.rmtree(self.paths.config.parent)
@@ -751,94 +822,83 @@ def remove_recorded_backup(path, ui, prefix=".agh-patcher-backup-"):
         durable_remove(path)
 
 
-def retire_legacy(paths, runner):
-    removed = False
-    for unit in ("agh-ui-sync.timer", "agh-ui-sync.service"):
-        file = paths.systemd / unit
-        loaded = runner.run("systemctl", "show", "--property=LoadState", "--value", unit, check=False)
-        exists = file.exists() or file.is_symlink() or loaded.stdout.strip() not in ("", "not-found")
-        if exists:
-            if unit == "agh-ui-sync.service":
-                # A stopped timer cannot start another run. Let an in-flight old
-                # filesystem swap finish instead of killing it halfway through.
-                for attempt in range(60):
-                    state = runner.run("systemctl", "show", "--property=ActiveState", "--value", unit, check=False).stdout.strip()
-                    if state in ("", "inactive", "failed"):
-                        break
-                    if attempt == 0:
-                        print("Legacy updater is running; waiting for completion (timer is disabled).")
-                    time.sleep(1)
-                else:
-                    raise Error("Legacy updater is still running; timer disabled. Wait for completion and rerun this administrator action.")
-            runner.run("systemctl", "disable", "--now", unit)
-            file.unlink(missing_ok=True)
-            for directory in (*paths.systemd.glob("*.wants"), *paths.systemd.glob("*.requires")):
-                (directory / unit).unlink(missing_ok=True)
-            removed = True
-    paths.legacy_command.unlink(missing_ok=True)
-    paths.legacy_config.unlink(missing_ok=True)
-    runner.run("systemctl", "daemon-reload")
-    if removed:
-        print("Legacy automatic updates disabled; timer/service removed.")
-
-
-def legacy_settings(paths):
-    if not paths.legacy_config.is_file():
-        return {}
-    owner = 0 if paths.root == Path("/") else os.geteuid()
-    if paths.legacy_config.is_symlink() or paths.legacy_config.stat().st_uid != owner or paths.legacy_config.stat().st_mode & 0o022:
-        raise Error("Unsafe legacy settings permissions")
-    result = {}
-    for line in paths.legacy_config.read_text().splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        if separator and key in ("AGH_DIR", "AGH_UI_ROOT", "DOCKER_CONTAINER", "GITHUB_REPO", "MODE"):
-            values = shlex.split(value)
-            if len(values) != 1 or "$" in values[0] or "`" in values[0]:
-                raise Error("Unsupported legacy settings; pass explicit installer options")
-            result[key] = values[0]
-    return result
-
-
-def clean_legacy_source(source):
-    directory = source / "install/systemd"
-    safe_directory(directory)
-    for name in ("agh-ui-sync.timer", "agh-ui-sync.service"):
-        file = directory / name
-        if file.exists() or file.is_symlink():
-            if file.is_dir() and not file.is_symlink():
-                raise Error(f"Expected an obsolete unit file, not a directory: {file}")
-            durable_remove(file)
-            print(f"Removed obsolete source template: {file}")
-
-
-def setup(mode, repository, container, source, paths=None, runner=None, environ=None):
+def setup(mode, repository, container, source, paths=None, runner=None, environ=None, compose_service=None):
     paths = paths or Paths()
     runner = runner or Runner()
     environ = environ if environ is not None else os.environ
     if not all((source / "scripts" / name).is_file() for name in ("agh-patcher.py", "agh-launch.sh")):
-        raise Error("Run setup through the downloaded repository's install/native or install/docker installer")
-    if paths.root == Path("/"):
-        secure_path(source / "install/systemd")
+        raise Error("Run setup through the released tools bundle's install/native or install/docker installer")
     spec = importlib.util.spec_from_file_location("release_identity", source / "scripts/release-manifest.py")
     identity = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(identity)
-    legacy = legacy_settings(paths)
+    # Import verification code without writing a cache into an unverified bundle.
+    bytecode_setting = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(identity)
+    finally:
+        sys.dont_write_bytecode = bytecode_setting
+    try:
+        released = identity.verify_tools(source)
+    except (OSError, ValueError) as error:
+        raise Error(f"Invalid released tools bundle: {error}") from error
+    if paths.root == Path("/"):
+        for name in (*identity.TOOLS_FILES, identity.TOOLS_MANIFEST):
+            secure_path(source / name)
     old = read_config(paths) if paths.config.exists() else {}
     if old and old["mode"] != mode:
         raise Error("Uninstall the existing patcher mode before changing native/Docker mode")
-    agh_dir = environ.get("AGH_DIR", old.get("agh_dir", legacy.get("AGH_DIR", "/opt/AdGuardHome")))
+    agh_dir = environ.get("AGH_DIR", old.get("agh_dir", "/opt/AdGuardHome"))
     config = {"schema": 1, "mode": mode,
-              "tooling_revision": identity.tooling_revision(source),
-              "repository": repository or old.get("repository", legacy.get("GITHUB_REPO", "rdna897/adguardhome-patcher")),
-              "ui_root": agh_dir if mode == "native" else environ.get("AGH_UI_ROOT", old.get("ui_root", legacy.get("AGH_UI_ROOT", "/opt/adguardhome-patcher/ui")))}
+              "tooling_revision": released["tooling_revision"],
+              "source_commit": released["source_commit"],
+              "repository": repository or old.get("repository", "rdna897/adguardhome-patcher"),
+              "ui_root": agh_dir if mode == "native" else environ.get("AGH_UI_ROOT", old.get("ui_root", "/opt/adguardhome-patcher/ui"))}
     if mode == "native":
         config["agh_dir"] = agh_dir
     else:
-        config["container"] = container or old.get("container", legacy.get("DOCKER_CONTAINER", "adguardhome"))
+        config["container"] = container or old.get("container", "adguardhome")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config["container"]):
+            raise Error("Invalid Docker container name")
+        labels = json.loads(runner.run("docker", "inspect", "--format", "{{json .Config.Labels}}", config["container"]).stdout) or {}
+        if not isinstance(labels, dict):
+            raise Error("Invalid Docker container labels")
+        actual_service = labels.get("com.docker.compose.service")
+        config["compose_service"] = compose_service or old.get("compose_service") or actual_service or config["container"]
+        if not isinstance(config["compose_service"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config["compose_service"]):
+            raise Error("Invalid Compose service name")
+        if actual_service and actual_service != config["compose_service"]:
+            raise Error("Compose service name does not match the container's Compose service label")
+        image = runner.run("docker", "inspect", "--format", "{{.Image}}", config["container"]).stdout.strip()
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
+            raise Error("Invalid Docker image identity")
+        config["docker_image_id"] = image
+        command = json.loads(runner.run(
+            "docker", "inspect", "--format", "{{json .Config.Cmd}}", config["container"]).stdout)
+        if labels.get(DOCKER_OVERRIDE_LABEL):
+            if image != old.get("docker_image_id"):
+                raise Error("Recreate the Docker container with its base Compose file only before rerunning the released Docker installer")
+            # The active entrypoint may have absorbed CMD.  A tooling-only
+            # reinstall retains the captured base command for the same image.
+            if command is None or command == []:
+                command = old["docker_effective_command"]
+        config["docker_effective_command"] = [] if command is None else command
+        if (not isinstance(config["docker_effective_command"], list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_effective_command"])):
+            raise Error("Invalid Docker effective command")
+        override_bytes, override_revision = docker_override((source / "install/docker/compose.override.yaml").read_text(), config, paths)
+        config["docker_override_sha256"] = hashlib.sha256(override_bytes).hexdigest()
+        config["docker_override_revision"] = override_revision
+        safe_directory(paths.docker_override.parent)
+        if paths.docker_override.is_symlink():
+            raise Error("Refusing a symlinked managed Docker override")
+        if paths.docker_override.exists() and not paths.docker_override.is_file():
+            raise Error("Refusing a non-regular managed Docker override")
+        if paths.docker_override.exists() and (not old or digest(paths.docker_override) != old.get("docker_override_sha256")):
+            raise Error("Managed Docker override is modified or unowned; preserve it separately before rerunning the installer")
     patcher = Patcher(config, paths, runner)
     version = patcher.version()
+    if released["adguard_version"] != version:
+        raise Error(f"Tools bundle supports {released['adguard_version']}, but installed AdGuard Home is {version}")
     if mode == "native":
         content = runner.run("systemctl", "cat", UNIT).stdout
         lines = [line.split("=", 1)[1] for line in content.splitlines() if line.startswith("ExecStart=") and line != "ExecStart="]
@@ -853,8 +913,6 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
         if "\n" in agh_dir or "\r" in agh_dir:
             raise Error("Invalid AdGuard Home path")
     with patcher.lock():
-        retire_legacy(paths, runner)
-        clean_legacy_source(source)
         install_file(source / "scripts/agh-patcher.py", paths.command)
         target = Path(agh_dir) / "agh-launch.sh" if mode == "native" else paths.docker_launcher
         if target.is_symlink():
@@ -862,6 +920,8 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
         install_file(source / "scripts/agh-launch.sh", target)
         if mode == "docker":
             durable_mkdir(patcher.ui)
+            if not paths.docker_override.exists() or paths.docker_override.read_bytes() != override_bytes:
+                install_bytes(override_bytes, paths.docker_override, 0o644)
         atomic_json(paths.config, config)
         paths.config.chmod(0o644)
         if mode == "native":
@@ -870,8 +930,10 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
                 secure_path(override)
             override.parent.mkdir(parents=True, exist_ok=True)
             override.write_text("# Added by adguardhome-patcher.\n[Service]\nExecStart=\nExecStart=" + command + "\n")
-        runner.run("systemctl", "daemon-reload")
+            runner.run("systemctl", "daemon-reload")
     revision, _ = patcher.local(version)
+    if mode == "docker":
+        print(f"Managed Compose override: {paths.docker_override}\nApply explicitly: {patcher.compose_action()}")
     print(f"AdGuard Home: {version}\nFrontend revision: {revision}\nTooling revision: {config['tooling_revision']}\n"
           "Automatic updates: disabled; no timer installed.\n"
           "Status: sudo agh-patcher status\nCheck: sudo agh-patcher check\n"
@@ -880,7 +942,7 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
 
 def main():
     parser = argparse.ArgumentParser(description="Manual AdGuard Home frontend patch management (no automatic updates)")
-    parser.add_argument("command", choices=("status", "check", "update", "uninstall", "install-native", "install-docker", "uninstall-native", "uninstall-docker"))
+    parser.add_argument("command", choices=("status", "check", "update", "uninstall", "install-native", "install-docker"))
     parser.add_argument("arguments", nargs="*")
     parser.add_argument("--yes", action="store_true", help="explicitly approve update/uninstall without an interactive prompt")
     args = parser.parse_args()
@@ -888,29 +950,20 @@ def main():
     try:
         if args.command not in ("status", "check") and os.geteuid() != 0:
             raise Error("Run this administrator action with sudo/root")
-        if args.yes and args.command not in ("update", "uninstall", "uninstall-native", "uninstall-docker"):
+        if args.yes and args.command not in ("update", "uninstall"):
             raise Error("--yes is only for explicitly requested update/uninstall")
         if args.command.startswith("install-"):
             source = Path(__file__).resolve().parent.parent
             mode = args.command.removeprefix("install-")
             if len(args.arguments) > (1 if mode == "native" else 2):
                 raise Error("Unexpected installer arguments")
-            setup(mode, args.arguments[-1] if args.arguments and (mode == "native" or len(args.arguments) > 1) else None,
-                  args.arguments[0] if mode == "docker" and args.arguments else None, source, paths)
+            setup(mode, args.arguments[0] if mode == "native" and args.arguments else None,
+                  args.arguments[0] if mode == "docker" and args.arguments else None, source, paths,
+                  compose_service=args.arguments[1] if mode == "docker" and len(args.arguments) > 1 else None)
             return
         if args.arguments:
             raise Error("Unexpected positional arguments")
-        if args.command.startswith("uninstall-") and not paths.config.exists():
-            legacy = legacy_settings(paths)
-            mode = args.command.removeprefix("uninstall-")
-            agh_dir = os.environ.get("AGH_DIR", legacy.get("AGH_DIR", "/opt/AdGuardHome"))
-            config = {"schema": 1, "mode": mode, "repository": "rdna897/adguardhome-patcher",
-                      "ui_root": agh_dir if mode == "native" else legacy.get("AGH_UI_ROOT", "/opt/adguardhome-patcher/ui"),
-                      "agh_dir": agh_dir, "container": legacy.get("DOCKER_CONTAINER", "adguardhome")}
-        else:
-            config = read_config(paths)
-        if args.command.startswith("uninstall-") and config["mode"] != args.command.removeprefix("uninstall-"):
-            raise Error("Uninstaller does not match configured native/Docker mode")
+        config = read_config(paths)
         patcher = Patcher(config, paths)
         if args.command in ("status", "check"):
             patcher.status(remote=args.command == "check")
