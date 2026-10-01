@@ -2,6 +2,7 @@
 """Explicit, confirmed frontend management; no scheduler or downloaded code execution."""
 
 import argparse
+import collections
 import contextlib
 import fcntl
 import hashlib
@@ -28,10 +29,17 @@ ASSET = "agh-dashboard-range.tar.gz"
 UNIT = "AdGuardHome.service"
 VERSION = r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
 REVISION = r"[a-f0-9]{64}"
+# patch_revision/"patch:" identify the built frontend bytes under build/static.
+FRONTEND_REVISION_ALGORITHM = "agh-frontend-static-sha256-v1"
+NOT_CHECKED = "Unknown (run agh-patcher check)"
+TOOLING_UPDATE = "Download the current patcher source and rerun its installer to update management tooling."
 
 
 class Error(Exception):
     pass
+
+
+Release = collections.namedtuple("Release", ("frontend", "tooling", "urls"))
 
 
 class Paths:
@@ -183,6 +191,47 @@ def digest(path):
     return checksum.hexdigest()
 
 
+def frontend_static_hashes(static):
+    """Return {relative path: SHA-256} for every regular file under build/static."""
+    if static.is_symlink() or not static.is_dir():
+        raise Error(f"Expected a frontend static directory: {static}")
+    def walk_error(error):
+        raise error
+    hashes = {}
+    for directory, children, files in os.walk(static, followlinks=False, onerror=walk_error):
+        for name in (*children, *files):
+            path = Path(directory) / name
+            relative = path.relative_to(static).as_posix()
+            try:
+                relative.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise Error(f"Unexpected frontend path encoding: {relative!r}") from error
+            if "\\" in relative or any(ord(character) < 32 or ord(character) == 127 for character in relative):
+                raise Error(f"Unexpected frontend path: {relative!r}")
+            mode = os.lstat(path).st_mode
+            if stat.S_ISREG(mode):
+                hashes[relative] = digest(path)
+            elif not stat.S_ISDIR(mode):
+                raise Error(f"Frontend contains a link or special file: {relative}")
+    if not hashes:
+        raise Error("Frontend static directory contains no files")
+    return hashes
+
+
+def artifact_revision(hashes):
+    """One deterministic SHA-256 over sorted relative paths and their file SHA-256 values."""
+    checksum = hashlib.sha256(FRONTEND_REVISION_ALGORITHM.encode() + b"\n")
+    for name in sorted(hashes, key=lambda value: value.encode("utf-8")):
+        if not isinstance(hashes[name], str) or not re.fullmatch(REVISION, hashes[name]):
+            raise Error(f"Invalid frontend file checksum: {name}")
+        checksum.update(name.encode("utf-8") + b"\0" + bytes.fromhex(hashes[name]))
+    return checksum.hexdigest()
+
+
+def frontend_artifact_revision(static):
+    return artifact_revision(frontend_static_hashes(static))
+
+
 def install_file(source, target):
     if target.is_symlink():
         raise Error(f"Refusing a symlinked tooling target: {target}")
@@ -280,7 +329,9 @@ def validate_archive(archive, destination, version, revision):
             raise Error("Invalid archive manifest")
         if stamp != version or manifest.get("adguard_version") != version:
             raise Error("Archive explicitly supports a different AdGuard Home version")
-        if manifest.get("schema") != 1 or manifest.get("patch_revision") != revision:
+        if manifest.get("schema") != 1 or manifest.get("revision_algorithm") != FRONTEND_REVISION_ALGORITHM:
+            raise Error("Archive manifest has no frontend artefact revision; rebuild it with current release tooling")
+        if manifest.get("patch_revision") != revision:
             raise Error("Archive revision does not match release metadata")
         files = manifest.get("files")
         actual = {name.removeprefix("build/static/") for name, member in members.items()
@@ -301,6 +352,12 @@ def validate_archive(archive, destination, version, revision):
         for name, expected in files.items():
             if digest(destination / "build/static" / name) != expected:
                 raise Error(f"Frontend checksum mismatch: {name}")
+        # Recompute the identity from the extracted bytes instead of trusting the manifest.
+        computed = frontend_artifact_revision(destination / "build/static")
+        if computed != manifest["patch_revision"]:
+            raise Error("Archive manifest revision does not describe its frontend files")
+        if computed != revision:
+            raise Error("Release metadata revision does not describe the archive's frontend files")
         index = IndexAssets()
         index.feed((destination / "build/static/index.html").read_text())
         if not index.scripts or any(source.removeprefix("./") not in files for source in index.scripts):
@@ -348,26 +405,37 @@ class Patcher:
             return revision, "Legacy frontend; update required for manifest verification"
         try:
             manifest = json.loads(manifest_path.read_text())
-            revision = manifest["patch_revision"]
-            if manifest.get("schema") != 1 or not re.fullmatch(REVISION, revision):
+            recorded = manifest["patch_revision"]
+            if manifest.get("schema") != 1 or not re.fullmatch(REVISION, recorded):
                 raise ValueError("Invalid manifest revision")
             if (manifest["adguard_version"] != version or (self.build / "VERSION").read_text().strip() != version):
-                return revision, "Installed patch is incompatible; launcher uses stock UI"
+                return recorded, "Installed patch is incompatible; launcher uses stock UI"
             if (self.build / "DISABLED").exists():
-                return revision, "Patched frontend disabled; launcher uses stock UI"
+                return recorded, "Patched frontend disabled; launcher uses stock UI"
             files = manifest["files"]
             if not isinstance(files, dict) or not files or "index.html" not in files:
                 raise ValueError("Incomplete frontend manifest")
-            for name, expected in files.items():
+            for name in files:
                 relative = PurePosixPath(name)
                 if relative.is_absolute() or ".." in relative.parts:
                     raise ValueError("Unsafe manifest path")
-                file = self.build / "static" / name
-                safe_directory(file.parent)
-                if file.is_symlink() or not file.is_file() or digest(file) != expected:
-                    return revision, f"Missing or damaged frontend file: {name}"
+            safe_directory(self.build / "static")
+            try:
+                actual = frontend_static_hashes(self.build / "static")
+            except Error as error:
+                return recorded, f"Missing or damaged frontend: {error}"
+            for name, expected in sorted(files.items()):
+                if actual.get(name) != expected:
+                    return recorded, f"Missing or damaged frontend file: {name}"
+            extra = sorted(set(actual) - set(files))
+            if extra:
+                return recorded, f"Unexpected frontend file: {extra[0]}"
+            # The installed identity is always derived from the installed bytes.
+            revision = artifact_revision(actual)
+            if manifest.get("revision_algorithm") == FRONTEND_REVISION_ALGORITHM and revision != recorded:
+                return recorded, "Frontend manifest revision does not match its installed files"
             return revision, "Healthy"
-        except (OSError, KeyError, ValueError, TypeError) as error:
+        except (OSError, KeyError, ValueError, TypeError, Error) as error:
             return "unknown", f"Invalid or incomplete frontend: {error}"
 
     def available(self, version):
@@ -382,6 +450,7 @@ class Patcher:
         match = re.search(r"^patch: ([a-f0-9]{64}|[a-f0-9]{16})$", metadata.get("body", ""), re.M)
         if not match:
             raise Error("Release has no explicit patch revision; rebuild it with current tooling")
+        tooling = re.search(r"^tooling: ([a-f0-9]{64})$", metadata["body"], re.M)
         urls = {}
         for name in (ASSET, ASSET + ".sha256"):
             assets = [asset for asset in metadata["assets"] if isinstance(asset, dict) and asset.get("name") == name]
@@ -389,34 +458,57 @@ class Patcher:
             if len(assets) != 1 or assets[0].get("browser_download_url") != expected:
                 raise Error(f"Missing or unexpected release asset: {name}")
             urls[name] = expected
-        return match.group(1), urls
+        return Release(match.group(1), tooling.group(1) if tooling else None, urls)
+
+    def tooling_comparison(self, available):
+        """Describe management tooling separately; it never selects a frontend update."""
+        installed = self.config.get("tooling_revision")
+        if available is None:
+            return "tooling revision not published by this release", None
+        if installed is None:
+            return ("installed tooling unknown (configuration predates tooling identity)",
+                    "Download the current patcher source and rerun its installer to record and update management tooling.")
+        if installed == available:
+            return "tooling up to date", None
+        return "tooling update available", TOOLING_UPDATE
 
     def status(self, remote=False):
         version = self.version()
         revision, health = self.local(version)
-        available = "Unknown (run agh-patcher check)"
+        available = available_tooling = NOT_CHECKED
         status = "Installed; availability not checked" if health == "Healthy" else health
+        actions = []
         if remote:
             try:
-                available, _ = self.available(version)
-                status = "Up to date" if revision == available and health == "Healthy" else "Update available"
+                release = self.available(version)
+            except Error as error:
+                self.print_status(version, revision, "Unavailable", "Unavailable", str(error))
+                raise
+            available = release.frontend
+            available_tooling = release.tooling or "Not published by this release"
+            if revision == available and health == "Healthy":
+                status = "Frontend up to date"
+            else:
+                status = "Frontend update available"
+                actions.append("Run sudo agh-patcher update to review and install the frontend.")
                 if health not in ("Healthy", "No patched frontend installed"):
                     status += "; " + health
-            except Error as error:
-                available = "Unavailable"
-                status = str(error)
-                self.print_status(version, revision, available, status)
-                raise
+            tooling_status, tooling_action = self.tooling_comparison(release.tooling)
+            status += "; " + tooling_status
+            if tooling_action:
+                actions.append(tooling_action)
         if (self.paths.state / "transaction.json").exists():
             status += "; interrupted update (retained backup requires recovery)"
         if (self.paths.systemd / "agh-ui-sync.timer").exists() or (self.paths.systemd / "agh-ui-sync.service").exists():
             status += "; legacy updater artefacts present — rerun installer to disable/remove them"
-        self.print_status(version, revision, available, status)
+        self.print_status(version, revision, available, available_tooling, status, actions)
 
-    def print_status(self, version, revision, available, status):
-        tooling = self.config.get("tooling_revision", "Unknown (rerun installer)")
-        print(f"AdGuard Home:       {version}\nFrontend revision:  {revision}\nTooling revision:   {tooling}\n"
-              f"Available frontend: {available}\nStatus:             {status}")
+    def print_status(self, version, revision, available, available_tooling, status, actions=()):
+        tooling = self.config.get("tooling_revision", "Unknown (configuration predates tooling identity; rerun installer)")
+        rows = [("AdGuard Home", version), ("Frontend revision", revision), ("Available frontend", available),
+                ("Tooling revision", tooling), ("Available tooling", available_tooling), ("Status", status),
+                *(("Next action", action) for action in actions)]
+        print("\n".join(f"{label + ':':<21}{value}" for label, value in rows))
 
     @contextlib.contextmanager
     def lock(self):
@@ -462,7 +554,12 @@ class Patcher:
     def update(self, yes=False):
         version = self.version()
         previous, health = self.local(version)
-        revision, urls = self.available(version)
+        release = self.available(version)
+        revision, urls = release.frontend, release.urls
+        tooling_status, tooling_action = self.tooling_comparison(release.tooling)
+        if tooling_action:
+            # Reported only: update installs frontend files, never host management tooling.
+            print(f"Note: {tooling_status}. {tooling_action}")
         if (self.paths.state / "transaction.json").exists():
             raise Error("An interrupted update has a retained backup; recover it before another update (see docs/manual-updates.md)")
         if previous == revision and health == "Healthy":

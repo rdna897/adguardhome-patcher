@@ -22,13 +22,26 @@ spec.loader.exec_module(p)
 spec = importlib.util.spec_from_file_location("identity", SOURCE / "scripts/release-manifest.py")
 identity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(identity)
-OLD, NEW = "a" * 64, "b" * 64
 VERSION = "v0.107.79"
 
 
-def frontend(revision=NEW, version=VERSION):
-    files = {"index.html": b'<html><script src="main.js"></script></html>', "main.js": b"// fixture " + revision.encode()}
-    manifest = {"schema": 1, "adguard_version": version, "patch_revision": revision,
+def static_files(label):
+    return {"index.html": b'<html><script src="main.js"></script></html>', "main.js": b"// fixture " + label.encode()}
+
+
+def revision_of(label):
+    return p.artifact_revision({name: hashlib.sha256(value).hexdigest() for name, value in static_files(label).items()})
+
+
+OLD, NEW = revision_of("old"), revision_of("new")
+LABELS = {OLD: "old", NEW: "new"}
+
+
+def frontend(revision=NEW, version=VERSION, claimed=None):
+    """A UI archive tree whose manifest revision is computed from its static bytes unless claimed."""
+    files = static_files(LABELS[revision])
+    manifest = {"schema": 1, "adguard_version": version, "revision_algorithm": p.FRONTEND_REVISION_ALGORITHM,
+                "patch_revision": claimed or revision,
                 "files": {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}}
     return {**{"build/static/" + name: value for name, value in files.items()},
             "build/VERSION": version.encode(), "build/MANIFEST.json": json.dumps(manifest).encode()}
@@ -60,8 +73,9 @@ class FakeNetwork:
         if url.endswith(".sha256"):
             return (self.sha + "  " + p.ASSET + "\n").encode()
         tag = "ui-" + self.version
+        body = "patch: " + self.revision + ("\ntooling: " + self.tooling if self.tooling else "")
         return json.dumps({"tag_name": tag, "draft": False,
-                           "body": "patch: " + self.revision + "\ntooling: " + self.tooling,
+                           "body": body,
                            "assets": [{"name": name, "browser_download_url":
                                        f"https://github.com/rdna897/adguardhome-patcher/releases/download/{tag}/{name}"}
                                       for name in (p.ASSET, p.ASSET + ".sha256")]}).encode()
@@ -231,8 +245,8 @@ class ManualPatcher(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.tool.status(remote=True)
-        self.assertIn("Update available", output.getvalue())
-        self.assertIn(NEW, output.getvalue())
+        self.assertIn("Frontend update available", output.getvalue())
+        self.assertIn("Available frontend:  " + NEW, output.getvalue())
         self.assertEqual(before, self.snapshot())
         self.assert_no_restart()
         self.assertEqual(len(self.network.calls), 1)
@@ -322,7 +336,7 @@ class ManualPatcher(unittest.TestCase):
         self.assertEqual(receipt["patch_revision"], NEW)
         self.assertEqual(receipt["archive_sha256"], self.network.sha)
         state = json.loads((self.paths.state / "last-update.json").read_text())
-        self.assertIn(OLD.encode(), (Path(state["backup"]) / "static/main.js").read_bytes())
+        self.assertEqual(b"// fixture old", (Path(state["backup"]) / "static/main.js").read_bytes())
         self.assertFalse((self.paths.state / "transaction.json").exists())
         self.assertEqual((self.agh / "work/data.db").read_bytes(), data)
         self.assertEqual((self.agh / "AdGuardHome.yaml").read_bytes(), config)
@@ -512,75 +526,272 @@ class ManualPatcher(unittest.TestCase):
             shutil.copyfile(SOURCE / name, target)
         return root
 
-    def test_docs_and_tests_do_not_change_frontend_or_tooling_identity(self):
-        root = self.identity_tree()
-        before = identity.frontend_revision(root), identity.tooling_revision(root)
-        for name in ("README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py"):
-            file = root / name
-            file.write_text(file.read_text() + "\nchanged\n")
-        self.assertEqual(before, (identity.frontend_revision(root), identity.tooling_revision(root)))
+    def static_tree(self, name, files, order=None):
+        static = self.root / name / "static"
+        for relative in order or files:
+            target = static / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(files[relative])
+        return static
 
-    def test_tooling_changes_independently_without_changing_frontend(self):
-        root = self.identity_tree()
-        frontend_before, tooling_before = identity.frontend_revision(root), identity.tooling_revision(root)
-        for name in ("scripts/agh-patcher.py", "install/native/install.sh", "scripts/build-release.sh"):
-            file = root / name
-            file.write_text(file.read_text() + "\n# management change\n")
-        self.assertEqual(identity.frontend_revision(root), frontend_before)
-        self.assertNotEqual(identity.tooling_revision(root), tooling_before)
+    BUILT = {"index.html": b'<html><script src="main.0123.js"></script><link href="main.a13f.css"></html>',
+             "main.0123.js": b"bundle", "main.a13f.css": b"body{}", "assets/favicon.png": b"\x89PNG",
+             "assets/deep/icon.svg": b"<svg/>"}
 
-    def test_frontend_inputs_change_identity_but_timestamps_do_not(self):
+    def test_artifact_revision_ignores_creation_order_and_timestamps(self):
+        first = self.static_tree("first", self.BUILT)
+        second = self.static_tree("second", self.BUILT, order=sorted(self.BUILT, reverse=True))
+        revision = p.frontend_artifact_revision(first)
+        self.assertRegex(revision, "^[a-f0-9]{64}$")
+        self.assertEqual(p.frontend_artifact_revision(second), revision)
+        for path in (second, *second.rglob("*")):
+            os.utime(path, (1, 1))
+        self.assertEqual(p.frontend_artifact_revision(second), revision)
+
+    def test_artifact_revision_changes_with_any_static_content_or_file_set(self):
+        static = self.static_tree("built", self.BUILT)
+        before = p.frontend_artifact_revision(static)
+        changes = (
+            lambda: (static / "assets/deep/icon.svg").write_bytes(b"<svg />"),
+            lambda: (static / "late.js").write_bytes(b"added"),
+            lambda: (static / "assets/favicon.png").unlink(),
+            lambda: (static / "main.a13f.css").rename(static / "main.57ad.css"),
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                shutil.rmtree(static.parent)
+                static = self.static_tree("built", self.BUILT)
+                self.assertEqual(p.frontend_artifact_revision(static), before)
+                change()
+                self.assertNotEqual(p.frontend_artifact_revision(static), before)
+
+    def test_artifact_revision_rejects_links_special_files_and_unexpected_paths(self):
+        cases = {
+            "file link": lambda static: (static / "link.js").symlink_to(static / "main.0123.js"),
+            "directory link": lambda static: (static / "linked").symlink_to(static / "assets", target_is_directory=True),
+            "fifo": lambda static: os.mkfifo(static / "fifo"),
+            "backslash": lambda static: (static / "odd\\name.js").write_bytes(b"x"),
+            "control character": lambda static: (static / "odd\nname.js").write_bytes(b"x"),
+        }
+        for name, make in cases.items():
+            with self.subTest(name=name):
+                static = self.static_tree(name.replace(" ", "-"), self.BUILT)
+                make(static)
+                with self.assertRaises(p.Error):
+                    p.frontend_artifact_revision(static)
+        outside = self.static_tree("outside", self.BUILT)
+        (self.root / "linked-static").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(p.Error):
+            p.frontend_artifact_revision(self.root / "linked-static")
+
+    def test_docs_tests_and_tooling_do_not_change_built_artifact_revision(self):
+        root = self.identity_tree()
+        build = self.static_tree("manifest-build", self.BUILT).parent
+        first = identity.manifest(root, build, VERSION)
+        for name in ("README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py",
+                     "scripts/agh-patcher.py", "install/native/install.sh"):
+            file = root / name
+            file.write_text(file.read_text() + "\n# documentation/test/tooling change\n")
+        second = identity.manifest(root, build, VERSION)
+        self.assertEqual(second["patch_revision"], first["patch_revision"])
+        self.assertEqual(second["patch_revision"], p.frontend_artifact_revision(build / "static"))
+        self.assertEqual(second["files"], first["files"])
+        self.assertEqual(second["frontend_input_revision"], first["frontend_input_revision"])
+        self.assertNotEqual(second["tooling_revision"], first["tooling_revision"])
+        self.assertNotIn("MANIFEST.json", second["files"])
+
+    def test_build_environment_change_rebuilds_and_changed_output_has_new_revision(self):
+        root = self.identity_tree()
+        before = identity.frontend_input_revision(root)
+        workflow = root / ".github/workflows/build.yml"
+        self.assertIn("node-version: 22", workflow.read_text())
+        workflow.write_text(workflow.read_text().replace("node-version: 22", "node-version: 24"))
+        self.assertNotEqual(identity.frontend_input_revision(root), before)
+        # Same CSS bytes under another webpack compilation hash is still a different frontend.
+        renamed = {**self.BUILT, "index.html": self.BUILT["index.html"].replace(b"a13f", b"57ad")}
+        renamed["main.57ad.css"] = renamed.pop("main.a13f.css")
+        self.assertNotEqual(p.frontend_artifact_revision(self.static_tree("node22", self.BUILT)),
+                            p.frontend_artifact_revision(self.static_tree("node24", renamed)))
+
+    def test_frontend_input_fingerprint_tracks_build_inputs_but_not_timestamps(self):
         root = self.identity_tree()
         for name in identity.FRONTEND_INPUTS:
             with self.subTest(name=name):
-                before = identity.frontend_revision(root)
+                before = identity.frontend_input_revision(root)
                 file = root / name
                 os.utime(file, (1, 1))
-                self.assertEqual(identity.frontend_revision(root), before)
-                file.write_text(file.read_text() + "\n# frontend change\n")
-                self.assertNotEqual(identity.frontend_revision(root), before)
+                self.assertEqual(identity.frontend_input_revision(root), before)
+                file.write_text(file.read_text() + "\n# frontend build change\n")
+                self.assertNotEqual(identity.frontend_input_revision(root), before)
+
+    def test_tooling_changes_independently_of_frontend_inputs(self):
+        root = self.identity_tree()
+        input_before, tooling_before = identity.frontend_input_revision(root), identity.tooling_revision(root)
+        for name in ("scripts/agh-patcher.py", "install/native/install.sh", "install/docker/compose.override.yaml"):
+            file = root / name
+            file.write_text(file.read_text() + "\n# management change\n")
+        self.assertEqual(identity.frontend_input_revision(root), input_before)
+        self.assertNotEqual(identity.tooling_revision(root), tooling_before)
+
+    def release_dir(self, root, claimed=None):
+        build = self.root / "release/build"
+        static = self.static_tree("release/build", static_files("new")).parent
+        self.assertEqual(static, build)
+        (build / "VERSION").write_text(VERSION + "\n")
+        result = identity.manifest(root, build, VERSION)
+        if claimed:
+            result["patch_revision"] = claimed
+            (build / "MANIFEST.json").write_text(json.dumps(result))
+        out = self.root / "release/dist"
+        out.mkdir(exist_ok=True)
+        with tarfile.open(out / p.ASSET, "w:gz") as bundle:
+            for name in ("build/static", "build/VERSION", "build/MANIFEST.json"):
+                bundle.add(self.root / "release" / name, name)
+        return out, result
+
+    def test_release_revision_is_recomputed_from_the_packaged_frontend(self):
+        root = self.identity_tree()
+        out, result = self.release_dir(root)
+        verified = identity.archive_revision(root, out, VERSION)
+        self.assertEqual(verified["patch_revision"], result["patch_revision"])
+        self.assertEqual(verified["patch_revision"], NEW)
+
+    def test_release_with_false_manifest_revision_cannot_be_published(self):
+        root = self.identity_tree()
+        out, _ = self.release_dir(root, claimed=OLD)
+        # release-manifest.py loads its own updater module, so match the updater's message.
+        with self.assertRaisesRegex(Exception, "does not describe its frontend files"):
+            identity.archive_revision(root, out, VERSION)
+
+    def test_archive_with_false_manifest_revision_is_rejected_before_mutation(self):
+        self.install_old()
+        forged = "d" * 64
+        self.tool.network = self.network = FakeNetwork(archive(frontend(NEW, claimed=forged)), revision=forged)
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "does not describe its frontend files"):
+            self.tool.update(yes=True)
+        self.assertEqual(before, self.snapshot())
+        self.assert_no_restart()
+
+    def test_release_metadata_revision_must_match_archive_frontend(self):
+        self.install_old()
+        self.network.revision = "e" * 64
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "does not match release metadata"):
+            self.tool.update(yes=True)
+        self.assertEqual(before, self.snapshot())
+        self.assert_no_restart()
+        target = self.root / "extracted"
+        (self.root / "valid.tar.gz").write_bytes(archive(frontend(NEW)))
+        with self.assertRaisesRegex(p.Error, "does not match release metadata"):
+            p.validate_archive(self.root / "valid.tar.gz", target, VERSION, OLD)
+
+    def test_archive_without_artifact_revision_must_be_rebuilt(self):
+        files = frontend(NEW)
+        manifest = json.loads(files["build/MANIFEST.json"])
+        del manifest["revision_algorithm"]
+        files["build/MANIFEST.json"] = json.dumps(manifest).encode()
+        self.tool.network = FakeNetwork(archive(files))
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "no frontend artefact revision"):
+            self.tool.update(yes=True)
+        self.assertEqual(before, self.snapshot())
+
+    def check_output(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.tool.status(remote=True)
+        return output.getvalue()
 
     def test_same_frontend_newer_tooling_never_offers_or_installs_frontend_update(self):
         root = self.identity_tree()
-        revision = identity.frontend_revision(root)
-        tooling = identity.tooling_revision(root)
-        for name, value in frontend(revision).items():
-            target = self.agh / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(value)
-        self.config["tooling_revision"] = tooling
+        installed_tooling = identity.tooling_revision(root)
+        self.install_old()
+        self.config["tooling_revision"] = installed_tooling
         manager = root / "scripts/agh-patcher.py"
         manager.write_text(manager.read_text() + "\n# newer management tooling\n")
-        self.network.revision = identity.frontend_revision(root)
-        self.network.tooling = identity.tooling_revision(root)
-        self.assertEqual(self.network.revision, revision)
-        self.assertNotEqual(self.network.tooling, tooling)
+        self.network.revision, self.network.tooling = OLD, identity.tooling_revision(root)
+        self.assertNotEqual(self.network.tooling, installed_tooling)
         before = self.snapshot()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.tool.status(remote=True)
             self.tool.update(yes=True)
-        self.assertIn("Up to date", output.getvalue())
-        self.assertNotIn("Update available", output.getvalue())
-        self.assertIn("Tooling revision:   " + tooling, output.getvalue())
+        text = output.getvalue()
+        self.assertIn("Status:              Frontend up to date; tooling update available", text)
+        self.assertIn("Tooling revision:    " + installed_tooling, text)
+        self.assertIn("Available tooling:   " + self.network.tooling, text)
+        self.assertIn("Next action:         " + p.TOOLING_UPDATE, text)
+        self.assertIn("Up to date: " + OLD, text)
+        self.assertNotIn("Frontend update available", text)
         self.assertEqual(before, self.snapshot())
         self.assertTrue(all("api.github.com" in url for url in self.network.calls))
         self.assert_no_restart()
 
-    def test_ui_manifest_identity_keeps_tooling_provenance_separate(self):
-        root = self.identity_tree()
-        build = self.root / "manifest-build"
-        (build / "static").mkdir(parents=True)
-        (build / "static/index.html").write_text("frontend unchanged")
-        identity.manifest(root, build, VERSION)
-        before = json.loads((build / "MANIFEST.json").read_text())
-        manager = root / "scripts/agh-patcher.py"
-        manager.write_text(manager.read_text() + "\n# newer manager\n")
-        identity.manifest(root, build, VERSION)
-        after = json.loads((build / "MANIFEST.json").read_text())
-        self.assertEqual(before["patch_revision"], after["patch_revision"])
-        self.assertEqual(before["files"], after["files"])
-        self.assertNotEqual(before["tooling_revision"], after["tooling_revision"])
+    def test_changed_frontend_bytes_offer_update_independently_of_tooling(self):
+        self.install_old()
+        self.config["tooling_revision"] = self.network.tooling
+        text = self.check_output()
+        self.assertIn("Status:              Frontend update available; tooling up to date", text)
+        self.assertIn("Next action:         Run sudo agh-patcher update", text)
+        self.assertNotIn(p.TOOLING_UPDATE, text)
+
+    def test_check_with_unrecorded_tooling_keeps_frontend_current(self):
+        self.install_old()
+        self.network.revision = OLD
+        text = self.check_output()
+        self.assertIn("Tooling revision:    Unknown (configuration predates tooling identity", text)
+        self.assertIn("Frontend up to date; installed tooling unknown", text)
+        self.assertIn("rerun its installer", text)
+        self.assertNotIn("Frontend update available", text)
+
+    def test_status_is_offline_and_leaves_available_tooling_unknown(self):
+        self.install_old()
+        self.config["tooling_revision"] = "1" * 64
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.tool.status()
+        self.assertIn("Tooling revision:    " + "1" * 64, output.getvalue())
+        self.assertIn("Available tooling:   " + p.NOT_CHECKED, output.getvalue())
+        self.assertNotIn("Next action", output.getvalue())
+        self.assertEqual(self.network.calls, [])
+
+    def test_release_without_tooling_identity_is_reported_without_frontend_update(self):
+        self.install_old()
+        self.network.revision, self.network.tooling = OLD, None
+        self.config["tooling_revision"] = "1" * 64
+        text = self.check_output()
+        self.assertIn("Available tooling:   Not published by this release", text)
+        self.assertIn("Frontend up to date; tooling revision not published", text)
+
+    def test_extra_installed_static_file_is_damage_and_changes_identity(self):
+        self.install_old()
+        (self.agh / "build/static/extra.js").write_bytes(b"unexpected")
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Unexpected frontend file: extra.js"))
+        self.network.revision = OLD
+        self.assertIn("Frontend update available; Unexpected frontend file", self.check_output())
+
+    def test_preartifact_manifest_is_identified_by_installed_bytes(self):
+        self.install_old()
+        manifest_path = self.agh / "build/MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["revision_algorithm"]
+        manifest["patch_revision"] = "a" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+        self.network.revision = OLD
+        before = self.snapshot()
+        self.tool.update(yes=True)
+        self.assertEqual(before, self.snapshot())
+        self.assert_no_restart()
+
+    def test_forged_installed_manifest_revision_is_reported(self):
+        self.install_old()
+        manifest_path = self.agh / "build/MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["patch_revision"] = NEW
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertEqual(self.tool.local(VERSION)[1], "Frontend manifest revision does not match its installed files")
 
     def test_installer_migration_removes_old_source_templates_and_updates_tooling_without_restart(self):
         root = self.identity_tree()

@@ -179,13 +179,29 @@ agh-patcher check
 sudo agh-patcher update
 ```
 
-`status` is local and read-only: it shows the binary version, installed frontend revision, installed tooling revision and frontend health, with availability marked unknown until you explicitly check. Older manager configurations show an unknown tooling revision until the installer is rerun. It does not contact GitHub or record a cache. `check` explicitly contacts the configured public GitHub release source and reports frontend **Up to date** or **Update available**, without replacing files, changing services or writing installation state. A newer release tooling revision alone does not indicate a frontend update.
+`status` is local and read-only: it shows the binary version, installed frontend revision, installed tooling revision and frontend health, with available frontend and tooling marked unknown until you explicitly check. Older manager configurations show an unknown tooling revision until the installer is rerun. It does not contact GitHub or record a cache.
+
+`check` explicitly contacts the configured public GitHub release source and compares the frontend and the management tooling separately, without replacing files, changing services or writing installation state:
+
+```text
+AdGuard Home:        v0.107.79
+Frontend revision:   3da056b3…
+Available frontend:  3da056b3…
+Tooling revision:    1d9c0e44…
+Available tooling:   8f02a7b5…
+Status:              Frontend up to date; tooling update available
+Next action:         Download the current patcher source and rerun its installer to update management tooling.
+```
+
+A tooling update never makes the frontend appear outdated, and `update` never installs host tooling: follow **Update the host scripts** below. Rerunning the installer does not restart AdGuard Home.
 
 `update` checks metadata for `ui-<installed AdGuard Home version>`, downloads the archive/checksum into a private temporary directory, verifies compatibility and all manifest file hashes, rejects unsafe tar paths/links/unexpected members, and explains the planned change. It performs no service restart or frontend mutation during preflight. Type `yes` to proceed; a declined prompt leaves the installation and services untouched. The deliberate non-interactive equivalent is `sudo agh-patcher update --yes`; do not schedule it if you require administrator-controlled updates.
 
-Frontend and tooling revisions are separate content identities, independent of the release's publication date. The frontend revision hashes only `patch/PATCH_BASE`, `patch/dashboard-range.patch`, and the production recipe `scripts/frontend-build.sh`; the exact upstream version and its locked build dependencies are selected by the compatibility tag. README, docs, tests, installer and manager changes do not change this revision. Release metadata's `patch:` line, the UI manifest's `patch_revision`, and frontend receipts use this frontend identity. The separate `tooling:` identity covers management/install/release tooling and is recorded locally only by rerunning the installer; downloading a UI never upgrades the host command.
+The **frontend revision** identifies the actual built dashboard: a SHA-256 over every file in the released `build/static` directory. Equal frontend revisions mean byte-identical frontend files, so documentation, tests, management tooling, build timestamps and publication dates cannot make a frontend look outdated, while any change to the built bytes (including one caused by a new build environment) does. Release metadata's `patch:` line, the UI manifest's `patch_revision`, the installed frontend receipt, `check` and `update` all use this revision, and the CLI recomputes it from the downloaded and installed files instead of trusting the manifest.
 
-Same compatible frontend revision and healthy files means no frontend download/replacement/restart, even when newer tooling has been published; leftover legacy updater artefacts still trigger a cleanup confirmation. Changed frontend build inputs indicate an update. Missing/damaged files can be repaired with the same verified revision. Older releases without the new manifest/revision are refused until rebuilt with current tooling. If the installed AdGuard Home version has no compatible release, the update is refused and the existing installation remains intact; the launcher uses the stock UI when its patch version does not match.
+The **tooling revision** (`tooling:`) is a separate identity for the host management, installer and release tooling. It is recorded locally only by rerunning the installer; downloading a UI never upgrades the host command.
+
+Same compatible frontend revision and healthy files means no frontend download/replacement/restart, even when newer tooling has been published; leftover legacy updater artefacts still trigger a cleanup confirmation. Changed frontend files indicate an update. Missing, damaged or unexpected extra files can be repaired with the same verified revision. Releases without a frontend artefact revision are refused until rebuilt with current tooling. If the installed AdGuard Home version has no compatible release, the update is refused and the existing installation remains intact; the launcher uses the stock UI when its patch version does not match.
 
 After confirmation, the CLI retires any legacy automatic updater, stages the complete verified build beside the live one, flushes its files/directories and commits a recovery journal before replacing the previous build through two same-filesystem directory renames. Each rename and journal phase is directory-fsynced. It restarts the service/container, verifies stable running state and frontend hashes, and durably records success before removing the journal. A failed swap, restart or validation restores the previous build and retries the original service; a first-install failure returns to the stock UI. Abrupt interruption requires manual inspection/recovery. These Linux durability boundaries depend on filesystem/storage honouring `fsync`; the two renames are not one atomic transaction. See [exact safety, durability and recovery limitations](docs/manual-updates.md).
 
@@ -194,6 +210,8 @@ Hard-refresh the dashboard after an update. On mobile, close and reopen the tab 
 ### Update the host scripts
 
 Existing installations must rerun the new installer to retire their legacy timer; downloading a frontend alone cannot migrate host tooling. Until you do this, an older installed sync script/timer retains its old behaviour.
+
+The same steps update management tooling whenever `agh-patcher check` reports **tooling update available**.
 
 Repeat **Download the installer (no Git required)** above to replace the patcher's files, then rerun the installer for your existing installation:
 
@@ -261,7 +279,15 @@ BROWSER_TEST=1 scripts/build-release.sh v0.107.79
 
 The gate verifies patch application, validation regressions, staged and unstaged applied-source whitespace, type checking, lint, frontend tests, production webpack output, desktop/mobile Live Query Log behaviour, and the official AdGuard Home binary smoke test. Release output includes the patched UI archive and checksum plus a corresponding source archive containing the patched upstream source, licence, patch, and build/install scripts.
 
-The gate also runs `python3 scripts/tests/test-patcher.py` against temporary native/Docker installations and mock services/network, including independent identities, no-op tooling-only updates, migration cleanup and transaction durability ordering. It never modifies a real AdGuard Home service. `scripts/release-manifest.py` supplies separate frontend and tooling revisions to release metadata; `build/MANIFEST.json` records the frontend identity, build tooling provenance, exact compatibility version and frontend file hashes. Publishing tooling changes refreshes source assets without making existing healthy frontends appear outdated. Archive verification checks every revision input is included and matches the repository.
+The gate also runs `python3 scripts/tests/test-patcher.py` against temporary native/Docker installations and mock services/network, including revision semantics, no-op tooling-only updates, migration cleanup and transaction durability ordering. It never modifies a real AdGuard Home service.
+
+For maintainers, `scripts/release-manifest.py` handles three identities:
+
+- **Frontend artefact revision** (`patch:`, `patch_revision`): computed from the built `build/static` files and used by installed hosts. Webpack's CSS file names depend on the absolute build path, so `build-release.sh` always builds at `/tmp/adguardhome-patcher-frontend-build`, and equivalent builds produce identical bytes.
+- **Frontend input fingerprint** (`frontend-input:`): `patch/PATCH_BASE`, the patch, `scripts/frontend-build.sh`, `scripts/build-release.sh` and the build workflow (including its Node version). CI uses it, together with the tooling revision, only to decide whether to rebuild; hosts never compare it.
+- **Tooling revision** (`tooling:`): the manager, launchers, installers, Compose override and release tooling.
+
+`build/MANIFEST.json` (outside `build/static`) records the artefact revision, input and tooling provenance, exact compatibility version and per-file hashes. The workflow publishes `patch:` only from an archive whose revision the updater has recomputed, and refuses to publish if the release notes and archive manifest disagree. A tooling-only change republishes source assets; a reproducible rebuild keeps the same `patch:`, so healthy frontends stay up to date. Archive verification also checks that every identity input in the source archive matches the repository.
 
 Browser validation covers action names, keyboard activation/focus, persisted Live preferences, browser-only clearing, singular/plural pending actions, and control spacing at 1440, 390, and 320 pixels wide, alongside the existing polling/state regressions. Set `LIVE_LOG_SCREENSHOT_DIR=/path/to/screenshots` when running the browser-inclusive gate to save viewport captures of inactive, Live, and queued-query states.
 

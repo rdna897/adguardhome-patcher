@@ -15,6 +15,11 @@
 # against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
 # production build, and a smoke test that runs the official binary of the
 # release with the patched UI.  Set SMOKE_TEST=0 to skip the last step.
+#
+# The UI manifest's patch_revision is the SHA-256 artefact revision of the built
+# build/static files.  Webpack's CSS names include a compilation hash that
+# depends on the absolute source path, so the frontend is always built at one
+# fixed path: equivalent builds then produce identical bytes and revisions.
 
 set -euo pipefail
 
@@ -36,7 +41,7 @@ fi
 
 work=$(mktemp -d)
 trap '$SUDO rm -rf "$work"' EXIT
-src="$work/agh"
+src=/tmp/adguardhome-patcher-frontend-build
 
 log() { printf '::notice::%s\n' "$*" >&2; }
 
@@ -116,6 +121,11 @@ smoke_test() {
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz*
 
+# Never reuse or delete a directory this run did not create.
+mkdir "$src" 2>/dev/null \
+	|| fail "fixed frontend build path $src already exists; remove it after any other build finishes"
+trap '$SUDO rm -rf "$work" "$src"' EXIT
+
 step "validation regression tests" python3 "$repo_root/scripts/tests/test-validation.py"
 step "manual patcher install/update/uninstall tests" python3 "$repo_root/scripts/tests/test-patcher.py"
 
@@ -164,7 +174,9 @@ echo "$tag" >"$src/build/VERSION"
 cp "$src/LICENSE.txt" "$src/build/LICENSE.txt"
 printf 'Modified AdGuard Home dashboard by adguardhome-patcher.\nUpstream: %s\nBuilt: %s\nSource: agh-dashboard-range-source.tar.gz in the same release.\n' \
 	"$tag" "$(date -u +%F)" >"$src/build/NOTICE"
-python3 "$repo_root/scripts/release-manifest.py" "$tag" "$src/build"
+frontend_revision=$(python3 "$repo_root/scripts/release-manifest.py" "$tag" "$src/build") \
+	|| fail "couldn't record the frontend artefact revision"
+log "frontend artefact revision: $frontend_revision"
 tar czf "$out/agh-dashboard-range.tar.gz" -C "$src" build/static build/VERSION build/LICENSE.txt build/NOTICE build/MANIFEST.json
 (cd "$out" && sha256sum agh-dashboard-range.tar.gz >agh-dashboard-range.tar.gz.sha256)
 mkdir -p "$src/patcher"
