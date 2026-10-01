@@ -1,6 +1,7 @@
 // Exercise the actual production UI with deterministic API fixtures and browser timers.
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { createRequire } = require('node:module');
 
 const source = path.resolve(process.argv[2] || '.');
@@ -36,7 +37,7 @@ async function check(browser, viewport) {
     await page.addInitScript(() => {
         // Start visible; later phases drive Page Visibility events explicitly.
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
-        localStorage.setItem('query_log_live', 'false');
+        if (localStorage.getItem('query_log_live') === null) localStorage.setItem('query_log_live', 'false');
         window.queryAudit = [];
         const original = window.fetch;
         window.fetch = (...args) => {
@@ -97,9 +98,35 @@ async function check(browser, viewport) {
         return route.fulfill({ json: body });
     });
 
-    const toggle = page.getByRole('button', { name: 'Live Query Log', exact: true });
+    const start = page.getByRole('button', { name: 'Start Live View', exact: true });
+    const pause = page.getByRole('button', { name: 'Pause Live View', exact: true });
+    const toggle = page.getByRole('button', { name: /^(Start|Pause) Live View$/ });
+    const clear = page.getByRole('button', { name: 'Clear view', exact: true });
     const rows = page.getByTestId('querylog_cell');
-    const indicator = page.getByRole('button', { name: '1 new query ↑', exact: true });
+    const indicator = page.getByRole('button', { name: /^\d+ new quer(?:y|ies) — Show newest$/ });
+    const screenshot = async (state) => {
+        if (!process.env.LIVE_LOG_SCREENSHOT_DIR) return;
+        await fs.mkdir(process.env.LIVE_LOG_SCREENSHOT_DIR, { recursive: true });
+        await page.screenshot({ path: path.join(process.env.LIVE_LOG_SCREENSHOT_DIR,
+            `query-log-${viewport.width < 768 ? `mobile-${viewport.width}` : 'desktop'}-${state}.png`), fullPage: false });
+    };
+    const checkControls = async (active) => {
+        await expect(active ? pause : start).toBeVisible();
+        await expect(active ? pause : start).toHaveAccessibleName(active ? 'Pause Live View' : 'Start Live View');
+        await expect(active ? start : pause).toHaveCount(0);
+        await expect(clear).toHaveCount(active ? 1 : 0);
+        assert.equal(await toggle.getAttribute('aria-pressed'), null);
+        assert.equal(await toggle.isEnabled(), true);
+        if (active) {
+            await expect(clear).toHaveAccessibleDescription('Clear only the displayed browser Live View. AdGuard Home’s server Query Log and history are kept.');
+            await expect(clear).toHaveClass(/btn-outline-secondary/);
+            const primaryBox = await pause.boundingBox();
+            const clearBox = await clear.boundingBox();
+            assert.equal(primaryBox.y, clearBox.y, 'Live actions stay on one row');
+            assert.ok(clearBox.x >= primaryBox.x + primaryBox.width + 7, 'Actions have a visible gap');
+        }
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    };
     const liveCount = () => page.evaluate(() => window.queryAudit.filter(url =>
         new URL(url, location.href).searchParams.get('limit') === '100').length);
     const tick = async (ms = 1200) => {
@@ -131,14 +158,25 @@ async function check(browser, viewport) {
     try {
         await page.goto('http://dashboard.example/#/logs?search=google.com&response_status=blocked');
         await page.bringToFront();
-        await expect(toggle).toHaveText('Paused');
+        await expect(start).toBeVisible();
+        await checkControls(false);
         await expect(rows).toHaveCount(20);
         await page.waitForLoadState('networkidle');
         await expect(page.locator('.logs__loading')).toHaveCount(1);
+        await expect(start).toHaveClass(/btn-primary/);
+        await start.focus();
+        await expect(start).toBeFocused();
+        assert.notEqual(await start.evaluate(el => getComputedStyle(el).boxShadow), 'none');
+        await screenshot('inactive');
         await page.clock.install();
         await page.clock.pauseAt(new Date(Date.now() + 100));
-        await toggle.click();
-        await expect(toggle).toHaveText('Live');
+        await start.press('Enter');
+        await checkControls(true);
+        assert.equal(await page.evaluate(() => localStorage.getItem('query_log_live')), 'true');
+        await screenshot('live');
+        await pause.press('Tab');
+        await expect(clear).toBeFocused();
+        assert.notEqual(await clear.evaluate(el => getComputedStyle(el).boxShadow), 'none');
         await page.waitForLoadState('networkidle');
         await waitForLiveFilter('google.com', 'blocked');
         assert.ok(await liveCount() >= 1);
@@ -158,6 +196,19 @@ async function check(browser, viewport) {
         records.unshift(rawRow(204));
         await tick();
         await expect(indicator).toBeVisible();
+        await expect(indicator).toHaveAccessibleName('1 new query — Show newest');
+        await expect(indicator).toHaveAttribute('title', /waiting while you read older rows/);
+        const indicatorBox = await indicator.boundingBox();
+        assert.ok(indicatorBox.x >= 0 && indicatorBox.x + indicatorBox.width <= viewport.width);
+        assert.equal(await indicator.evaluate(el => el.scrollWidth > el.clientWidth), false);
+        records.unshift(...Array.from({ length: 16 }, (_, i) => rawRow(206 + i * 2)));
+        await tick();
+        await expect(indicator).toHaveAccessibleName('17 new queries — Show newest');
+        const pendingBox = await indicator.boundingBox();
+        assert.ok(pendingBox.x >= 0 && pendingBox.x + pendingBox.width <= viewport.width);
+        assert.equal(await indicator.evaluate(el => el.scrollWidth > el.clientWidth), false);
+        await expect(rows).toHaveCount(21);
+        await screenshot('pending');
         await expect(rows).toHaveCount(21);
         assert.equal(await page.evaluate(() => scrollY), scrollBefore);
 
@@ -172,6 +223,7 @@ async function check(browser, viewport) {
             await page.getByRole('button', { name, exact: true }).click();
             await expect.poll(() => accessWrites.length).toBe(writes);
             await expect(indicator).toBeVisible();
+            await expect(indicator).toHaveAccessibleName('17 new queries — Show newest');
             await expect(rows).toHaveCount(21);
         }
         assert.deepEqual(accessWrites[0].disallowed_clients, ['192.0.2.11', '192.0.2.10']);
@@ -185,24 +237,29 @@ async function check(browser, viewport) {
         });
         // Invoke the header toggle without Playwright scrolling the viewport to it.
         await toggle.evaluate(element => element.click());
-        await expect(toggle).toHaveText('Paused');
+        await expect(start).toBeVisible();
+        await expect(clear).toHaveCount(0);
+        assert.equal(await page.evaluate(() => localStorage.getItem('query_log_live')), 'false');
         const pausedCount = await liveCount();
         await tick(5000);
         await tick(500); // Let the existing success-toast exit transition complete.
         assert.equal(await liveCount(), pausedCount);
         await expect(indicator).toBeVisible();
-        await indicator.click();
-        await expect(rows).toHaveCount(22);
+        await indicator.press('Enter');
+        await expect(rows).toHaveCount(38);
         await expect(indicator).toHaveCount(0);
         await toggle.click();
-        await expect(toggle).toHaveText('Live');
+        await expect(pause).toBeVisible();
         await page.waitForLoadState('networkidle');
-        await page.getByRole('button', { name: 'Clear view', exact: true }).click();
+        await checkControls(true);
+        await clear.focus();
+        await expect(clear).toBeFocused();
+        await clear.press('Space');
         await expect(rows).toHaveCount(0);
         await tick();
         await expect(rows).toHaveCount(0);
         assert.equal(serverClears, 0);
-        records.unshift(rawRow(206));
+        records.unshift(rawRow(238));
         await tick();
         await expect(rows).toHaveCount(1);
 
@@ -210,7 +267,7 @@ async function check(browser, viewport) {
         const hiddenCount = await liveCount();
         await tick(5000);
         assert.equal(await liveCount(), hiddenCount);
-        records.unshift(rawRow(208));
+        records.unshift(rawRow(240));
         await visibility('visible');
         await tick(0);
         assert.equal(await liveCount(), hiddenCount + 1);
@@ -221,9 +278,10 @@ async function check(browser, viewport) {
         await expect(page.locator('body')).toContainText('temporary query log failure');
         await expect(rows).toHaveCount(2);
         const failedCount = await liveCount();
+        await expect(pause).toBeEnabled(); // A failed poll must still be pausable.
         await tick(4000);
         assert.equal(await liveCount(), failedCount);
-        records.unshift(rawRow(210));
+        records.unshift(rawRow(242));
         await tick();
         assert.equal(await liveCount(), failedCount + 1);
         await expect(rows).toHaveCount(3);
@@ -249,8 +307,9 @@ async function check(browser, viewport) {
         await search.press('Enter');
         await page.waitForLoadState('networkidle');
         await waitForLiveFilter('google.com', 'all');
-        await toggle.click();
-        await expect(toggle).toHaveText('Paused');
+        await pause.press('Space');
+        await checkControls(false);
+        assert.equal(await page.evaluate(() => localStorage.getItem('query_log_live')), 'false');
         await expect(rows).toHaveCount(20);
         await page.waitForLoadState('networkidle');
         const loader = page.locator('.logs__loading');
@@ -265,8 +324,12 @@ async function check(browser, viewport) {
         assert.equal(requests.at(-1).limit, '20');
 
         await toggle.click();
-        await expect(toggle).toHaveText('Live');
+        await expect(pause).toBeVisible();
         await page.waitForLoadState('networkidle');
+        await tick();
+        await page.reload();
+        await page.waitForLoadState('networkidle');
+        await checkControls(true); // The persisted Live preference restores the Pause action.
         await tick();
         await page.evaluate(() => { location.hash = '#/guide'; });
         await expect(toggle).toHaveCount(0);
@@ -299,6 +362,7 @@ async function check(browser, viewport) {
     try {
         await check(browser, { width: 1440, height: 900 });
         await check(browser, { width: 390, height: 844 });
+        await check(browser, { width: 320, height: 740 });
     } finally {
         await browser.close();
     }

@@ -19,22 +19,22 @@ AdGuard Home Patcher adds frontend-only dashboard improvements to the official A
 
 ### Live Query Log
 
-- **Live / Paused** toggle on the existing Query Log page, with the preference retained in the browser.
+- **Start Live View / Pause Live View** actions on the existing Query Log page, with the preference retained in the browser.
 - Live mode polls the existing Query Log API roughly one second after each completed request; there is no WebSocket, backend push stream, or modified AdGuard Home binary.
 - Existing domain/client search and response-status filters continue to work in Live mode.
 - New DNS requests appear automatically while you remain at the newest entries.
 - Scrolling away from the top freezes the visible rows so troubleshooting history does not move underneath you.
-- Incoming entries are queued behind a **new queries ↑** indicator while you read older rows.
-- **Show Newest**/the pending indicator returns to the newest entries; naturally scrolling back to the top also reveals queued arrivals.
+- Incoming entries are queued behind a **new queries — Show newest** action while you read older rows.
+- **Show newest** returns to and reveals the newest entries; naturally scrolling back to the top also reveals queued arrivals.
 - Client block/unblock row actions preserve queued arrivals and their pending indicator.
-- **Clear view** clears only the browser's current view and never deletes the server Query Log.
+- **Clear view** is a secondary action available during Live mode. Its tooltip and screen-reader description explain that it clears only the displayed browser Live View and keeps the server Query Log/history.
 - Hidden tabs suspend polling and resume safely when visible again.
 - Request failures retain the current rows and retry after a five-second back-off.
 - The browser keeps at most **500 displayed rows plus 500 queued arrivals**.
 - Normal paused Query Log refresh and pagination remain available.
 - Desktop and mobile layouts are covered by production-browser validation.
 
-Live Query Log is deliberately a lightweight troubleshooting view rather than a lossless server-pushed stream. Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long request gaps, or time spent in a hidden tab can leave gaps in the live browser view. The authoritative server Query Log remains available through normal **Paused / Refresh** browsing.
+Live Query Log is deliberately a lightweight troubleshooting view rather than a lossless server-pushed stream. Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long request gaps, or time spent in a hidden tab can leave gaps in the live browser view. The authoritative server Query Log remains available through normal paused browsing and **Refresh**. See the [desktop and mobile control screenshots](docs/live-query-log-controls.md).
 
 ## Screenshots
 
@@ -242,6 +242,8 @@ BROWSER_TEST=1 scripts/build-release.sh v0.107.79
 ```
 
 The gate verifies patch application, validation regressions, staged and unstaged applied-source whitespace, type checking, lint, frontend tests, production webpack output, desktop/mobile Live Query Log behaviour, and the official AdGuard Home binary smoke test. Release output includes the patched UI archive and checksum plus a corresponding source archive containing the patched upstream source, licence, patch, and build/install scripts.
+
+Browser validation covers action names, keyboard activation/focus, persisted Live preferences, browser-only clearing, singular/plural pending actions, and control spacing at 1440, 390, and 320 pixels wide, alongside the existing polling/state regressions. Set `LIVE_LOG_SCREENSHOT_DIR=/path/to/screenshots` when running the browser-inclusive gate to save viewport captures of inactive, Live, and queued-query states.
 
 To edit the frontend patch:
 
