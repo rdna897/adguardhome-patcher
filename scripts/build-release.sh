@@ -146,7 +146,7 @@ step "npm ci" npm ci --no-audit --no-fund
 step "typecheck" npm run typecheck
 step "lint" npx eslint --ext .ts,.tsx "${ts_files[@]}"
 step "unit tests" npx vitest --run
-step "production build" npm run build-prod
+step "production build" sh "$repo_root/scripts/frontend-build.sh"
 [ -f "$src/build/static/index.html" ] || fail "build produced no index.html"
 
 if [ "$BROWSER_TEST" = 1 ]; then
@@ -172,6 +172,8 @@ cp -r "$repo_root/patch" "$repo_root/scripts" "$repo_root/install" "$src/patcher
 cp "$repo_root/LICENSE" "$repo_root/README.md" "$src/patcher/"
 mkdir -p "$src/patcher/docs"
 cp "$repo_root/docs/manual-updates.md" "$src/patcher/docs/"
+mkdir -p "$src/patcher/.github/workflows"
+cp "$repo_root/.github/workflows/build.yml" "$src/patcher/.github/workflows/"
 tar czf "$out/agh-dashboard-range-source.tar.gz" \
 	--exclude='./.git' --exclude='./client/node_modules' --exclude='./build' \
 	--exclude='*/__pycache__' --exclude='*.pyc' -C "$src" .

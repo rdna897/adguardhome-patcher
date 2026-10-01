@@ -75,7 +75,7 @@ sudo tar -xzf "$patcher_archive" --strip-components=1 -C /opt/adguardhome-patche
 rm -f "$patcher_archive"
 ```
 
-Then follow the native or Docker steps below. Extracting this archive also works over an existing patcher installation and preserves its downloaded `ui/` directory. Git is needed only if you want to develop or build the patch yourself.
+Then follow the native or Docker steps below. Extracting this archive also works over an existing patcher installation and preserves its downloaded `ui/` directory. Archive extraction does not remove obsolete files: rerunning the installer removes the two known legacy `install/systemd/agh-ui-sync.timer` and `.service` templates as well as the installed automatic updater. Git is needed only if you want to develop or build the patch yourself.
 
 ## Native installation
 
@@ -93,7 +93,7 @@ For a different binary directory:
 sudo env AGH_DIR=/your/AdGuardHome sh /opt/adguardhome-patcher/install/native/install.sh
 ```
 
-Requires Python 3.9 or newer. The installer copies the launcher beside the binary, installs `/usr/local/bin/agh-patcher`, writes `/etc/agh-patcher/config.json`, and adds a systemd override preserving the service's startup arguments. It disables/stops/removes any legacy `agh-ui-sync.timer` and service, removes the old updater/settings, and reloads systemd. It does not download a frontend, enable a timer, or restart AdGuard Home. Rerunning it preserves an existing compatible frontend and is suitable for upgrading the tooling.
+Requires Python 3.9 or newer. The installer copies the launcher beside the binary, installs `/usr/local/bin/agh-patcher`, writes `/etc/agh-patcher/config.json`, and adds a systemd override preserving the service's startup arguments. It disables/stops/removes any legacy `agh-ui-sync.timer` and service, removes the old updater/settings and obsolete source-tree unit templates, and reloads systemd. It does not download a frontend, enable a timer, or restart AdGuard Home. Rerunning it preserves an existing compatible frontend and upgrades the tooling revision separately.
 
 Check status and explicitly install/update the frontend:
 
@@ -179,13 +179,15 @@ agh-patcher check
 sudo agh-patcher update
 ```
 
-`status` is local and read-only: it shows the binary version, installed revision and frontend health, with availability marked unknown until you explicitly check. It does not contact GitHub or record a cache. `check` explicitly contacts the configured public GitHub release source and reports **Up to date** or **Update available**, without replacing files, changing services or writing installation state.
+`status` is local and read-only: it shows the binary version, installed frontend revision, installed tooling revision and frontend health, with availability marked unknown until you explicitly check. Older manager configurations show an unknown tooling revision until the installer is rerun. It does not contact GitHub or record a cache. `check` explicitly contacts the configured public GitHub release source and reports frontend **Up to date** or **Update available**, without replacing files, changing services or writing installation state. A newer release tooling revision alone does not indicate a frontend update.
 
 `update` checks metadata for `ui-<installed AdGuard Home version>`, downloads the archive/checksum into a private temporary directory, verifies compatibility and all manifest file hashes, rejects unsafe tar paths/links/unexpected members, and explains the planned change. It performs no service restart or frontend mutation during preflight. Type `yes` to proceed; a declined prompt leaves the installation and services untouched. The deliberate non-interactive equivalent is `sudo agh-patcher update --yes`; do not schedule it if you require administrator-controlled updates.
 
-Revision identity comes from release metadata and the verified manifest, not the release's original publication date. Same compatible revision and healthy files means no frontend update/restart; leftover legacy updater artefacts still trigger a cleanup confirmation. A different revision means an update is available. Missing/damaged files can be repaired with the same verified revision. Older releases without the new manifest/revision are refused until rebuilt with current tooling. If the installed AdGuard Home version has no compatible release, the update is refused and the existing installation remains intact; the launcher uses the stock UI when its patch version does not match.
+Frontend and tooling revisions are separate content identities, independent of the release's publication date. The frontend revision hashes only `patch/PATCH_BASE`, `patch/dashboard-range.patch`, and the production recipe `scripts/frontend-build.sh`; the exact upstream version and its locked build dependencies are selected by the compatibility tag. README, docs, tests, installer and manager changes do not change this revision. Release metadata's `patch:` line, the UI manifest's `patch_revision`, and frontend receipts use this frontend identity. The separate `tooling:` identity covers management/install/release tooling and is recorded locally only by rerunning the installer; downloading a UI never upgrades the host command.
 
-After confirmation, the CLI retires any legacy automatic updater, stages the complete verified build beside the live one, retains the previous build, and replaces it using directory renames on the same filesystem. It restarts the service/container, verifies stable running state and frontend hashes, and records the revision/archive checksum. A failed swap, restart or validation restores the previous build and retries the original service; a first-install failure returns to the stock UI. See [safety, rollback and migration details](docs/manual-updates.md).
+Same compatible frontend revision and healthy files means no frontend download/replacement/restart, even when newer tooling has been published; leftover legacy updater artefacts still trigger a cleanup confirmation. Changed frontend build inputs indicate an update. Missing/damaged files can be repaired with the same verified revision. Older releases without the new manifest/revision are refused until rebuilt with current tooling. If the installed AdGuard Home version has no compatible release, the update is refused and the existing installation remains intact; the launcher uses the stock UI when its patch version does not match.
+
+After confirmation, the CLI retires any legacy automatic updater, stages the complete verified build beside the live one, flushes its files/directories and commits a recovery journal before replacing the previous build through two same-filesystem directory renames. Each rename and journal phase is directory-fsynced. It restarts the service/container, verifies stable running state and frontend hashes, and durably records success before removing the journal. A failed swap, restart or validation restores the previous build and retries the original service; a first-install failure returns to the stock UI. Abrupt interruption requires manual inspection/recovery. These Linux durability boundaries depend on filesystem/storage honouring `fsync`; the two renames are not one atomic transaction. See [exact safety, durability and recovery limitations](docs/manual-updates.md).
 
 Hard-refresh the dashboard after an update. On mobile, close and reopen the tab if it still shows the old UI. A dashboard-only update does not require reinstalling AdGuard Home or pulling a new Docker image.
 
@@ -202,7 +204,7 @@ sudo sh /opt/adguardhome-patcher/install/native/install.sh
 sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
 ```
 
-Run only the command for your installation. If you customized the Compose override, retain those settings when downloading the new files; the archive replaces the supplied override. AdGuard Home data volumes and the downloaded `ui/` directory are preserved.
+Run only the command for your installation. This updates the tooling revision and removes known obsolete source-tree timer/service templates without downloading a frontend or restarting AdGuard Home. If you customized the Compose override, retain those settings when downloading the new files; the archive replaces the supplied override. AdGuard Home data volumes and the downloaded `ui/` directory are preserved.
 
 ### Update AdGuard Home
 
@@ -259,7 +261,7 @@ BROWSER_TEST=1 scripts/build-release.sh v0.107.79
 
 The gate verifies patch application, validation regressions, staged and unstaged applied-source whitespace, type checking, lint, frontend tests, production webpack output, desktop/mobile Live Query Log behaviour, and the official AdGuard Home binary smoke test. Release output includes the patched UI archive and checksum plus a corresponding source archive containing the patched upstream source, licence, patch, and build/install scripts.
 
-The gate also runs `python3 scripts/tests/test-patcher.py` against temporary native/Docker installations and mock services/network. It never modifies a real AdGuard Home service. `scripts/release-manifest.py` supplies the same content-derived revision to release notes and `build/MANIFEST.json`; the manifest records the exact compatibility version and frontend file hashes.
+The gate also runs `python3 scripts/tests/test-patcher.py` against temporary native/Docker installations and mock services/network, including independent identities, no-op tooling-only updates, migration cleanup and transaction durability ordering. It never modifies a real AdGuard Home service. `scripts/release-manifest.py` supplies separate frontend and tooling revisions to release metadata; `build/MANIFEST.json` records the frontend identity, build tooling provenance, exact compatibility version and frontend file hashes. Publishing tooling changes refreshes source assets without making existing healthy frontends appear outdated. Archive verification checks every revision input is included and matches the repository.
 
 Browser validation covers action names, keyboard activation/focus, persisted Live preferences, browser-only clearing, singular/plural pending actions, and control spacing at 1440, 390, and 320 pixels wide, alongside the existing polling/state regressions. Set `LIVE_LOG_SCREENSHOT_DIR=/path/to/screenshots` when running the browser-inclusive gate to save viewport captures of inactive, Live, and queued-query states.
 

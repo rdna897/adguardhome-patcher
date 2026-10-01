@@ -61,6 +61,7 @@ jobs:
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       patch_sha: ${{ steps.pick.outputs.patch_sha }}
+      tooling_sha: ${{ steps.pick.outputs.tooling_sha }}
       skip: ${{ steps.pick.outputs.skip }}
       build_outcome: ${{ steps.build.outcome }}
     steps:
@@ -86,18 +87,20 @@ jobs:
             exit 1
           fi
           patch_sha=$(python3 scripts/release-manifest.py)
+          tooling_sha=$(python3 scripts/release-manifest.py --tooling)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "patch_sha=$patch_sha" >> "$GITHUB_OUTPUT"
+          echo "tooling_sha=$tooling_sha" >> "$GITHUB_OUTPUT"
 
           existing=$(gh release view "ui-$tag" --json body --jq .body 2>/dev/null || true)
           if [ "$FORCE_REBUILD" != 'true' ]; then
-            if grep -Fq "patch: $patch_sha" <<<"$existing"; then
-              echo "ui-$tag already built for patch $patch_sha"
+            if grep -Fxq "patch: $patch_sha" <<<"$existing" && grep -Fxq "tooling: $tooling_sha" <<<"$existing"; then
+              echo "ui-$tag already built for frontend $patch_sha and tooling $tooling_sha"
               echo 'skip=true' >> "$GITHUB_OUTPUT"
             fi
             # Public issues cannot impersonate reports made by this workflow.
             if gh issue list --state open --author 'github-actions[bot]' \
-              --search "label:incompatible $tag $patch_sha in:body" \
+              --search "label:incompatible $tag $patch_sha $tooling_sha in:body" \
               --json number --jq '.[].number' | grep -q .; then
               echo "$tag is already reported incompatible with patch $patch_sha"
               echo 'skip=true' >> "$GITHUB_OUTPUT"
@@ -145,6 +148,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.build.outputs.tag }}
       PATCH_SHA: ${{ needs.build.outputs.patch_sha }}
+      TOOLING_SHA: ${{ needs.build.outputs.tooling_sha }}
       BUILD_COMMIT: ${{ github.sha }}
       BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -166,6 +170,7 @@ jobs:
           included in agh-dashboard-range-source.tar.gz in this release.
 
           patch: $PATCH_SHA
+          tooling: $TOOLING_SHA
           commit: $BUILD_COMMIT
           run: $BUILD_RUN_URL
           EOF
@@ -195,10 +200,11 @@ jobs:
 
           tag: $RELEASE_TAG
           patch: $PATCH_SHA
+          tooling: $TOOLING_SHA
           run: $BUILD_RUN_URL
           EOF
           existing=$(gh issue list --state open --author 'github-actions[bot]' \
-            --search "label:incompatible $RELEASE_TAG $PATCH_SHA in:body" --json number --jq '.[].number')
+            --search "label:incompatible $RELEASE_TAG $PATCH_SHA $TOOLING_SHA in:body" --json number --jq '.[].number')
           if [ -z "$existing" ]; then
             gh issue create --label incompatible \
               --title "$RELEASE_TAG: dashboard patch is not compatible" --body-file issue-body.md

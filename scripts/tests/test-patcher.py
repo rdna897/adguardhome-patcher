@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -52,13 +53,15 @@ class FakeNetwork:
         self.sha = hashlib.sha256(self.payload).hexdigest()
         self.calls = []
         self.fail_download = False
+        self.tooling = "c" * 64
 
     def read(self, url, limit):
         self.calls.append(url)
         if url.endswith(".sha256"):
             return (self.sha + "  " + p.ASSET + "\n").encode()
         tag = "ui-" + self.version
-        return json.dumps({"tag_name": tag, "draft": False, "body": "patch: " + self.revision,
+        return json.dumps({"tag_name": tag, "draft": False,
+                           "body": "patch: " + self.revision + "\ntooling: " + self.tooling,
                            "assets": [{"name": name, "browser_download_url":
                                        f"https://github.com/rdna897/adguardhome-patcher/releases/download/{tag}/{name}"}
                                       for name in (p.ASSET, p.ASSET + ".sha256")]}).encode()
@@ -168,6 +171,7 @@ class ManualPatcher(unittest.TestCase):
         self.assertTrue((self.agh / "agh-launch.sh").is_file())
         self.assertFalse((self.agh / "build").exists())
         self.assertFalse(list(self.paths.systemd.rglob("*.timer")))
+        self.assertFalse(list(self.paths.systemd.rglob("*.service")))
         self.assertFalse(any("enable" in command for command in self.runner.calls))
         self.assert_no_restart()
         self.assertEqual(self.network.calls, [])
@@ -499,19 +503,258 @@ class ManualPatcher(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("retired", result.stderr)
 
-    def test_content_identity_changes_on_new_source_not_file_timestamps(self):
+    def identity_tree(self):
         root = self.root / "identity"
-        root.mkdir()
-        (root / "README.md").write_text("docs")
-        (root / "LICENSE").write_text("license")
-        (root / "scripts").mkdir()
-        file = root / "scripts/tool.py"
-        file.write_text("revision one")
-        before = identity.revision(root)
-        os.utime(file, (1, 1))
-        self.assertEqual(identity.revision(root), before)
-        file.write_text("revision two")
-        self.assertNotEqual(identity.revision(root), before)
+        for name in (*identity.FRONTEND_INPUTS, *identity.TOOLING_INPUTS,
+                     "README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py"):
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SOURCE / name, target)
+        return root
+
+    def test_docs_and_tests_do_not_change_frontend_or_tooling_identity(self):
+        root = self.identity_tree()
+        before = identity.frontend_revision(root), identity.tooling_revision(root)
+        for name in ("README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py"):
+            file = root / name
+            file.write_text(file.read_text() + "\nchanged\n")
+        self.assertEqual(before, (identity.frontend_revision(root), identity.tooling_revision(root)))
+
+    def test_tooling_changes_independently_without_changing_frontend(self):
+        root = self.identity_tree()
+        frontend_before, tooling_before = identity.frontend_revision(root), identity.tooling_revision(root)
+        for name in ("scripts/agh-patcher.py", "install/native/install.sh", "scripts/build-release.sh"):
+            file = root / name
+            file.write_text(file.read_text() + "\n# management change\n")
+        self.assertEqual(identity.frontend_revision(root), frontend_before)
+        self.assertNotEqual(identity.tooling_revision(root), tooling_before)
+
+    def test_frontend_inputs_change_identity_but_timestamps_do_not(self):
+        root = self.identity_tree()
+        for name in identity.FRONTEND_INPUTS:
+            with self.subTest(name=name):
+                before = identity.frontend_revision(root)
+                file = root / name
+                os.utime(file, (1, 1))
+                self.assertEqual(identity.frontend_revision(root), before)
+                file.write_text(file.read_text() + "\n# frontend change\n")
+                self.assertNotEqual(identity.frontend_revision(root), before)
+
+    def test_same_frontend_newer_tooling_never_offers_or_installs_frontend_update(self):
+        root = self.identity_tree()
+        revision = identity.frontend_revision(root)
+        tooling = identity.tooling_revision(root)
+        for name, value in frontend(revision).items():
+            target = self.agh / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(value)
+        self.config["tooling_revision"] = tooling
+        manager = root / "scripts/agh-patcher.py"
+        manager.write_text(manager.read_text() + "\n# newer management tooling\n")
+        self.network.revision = identity.frontend_revision(root)
+        self.network.tooling = identity.tooling_revision(root)
+        self.assertEqual(self.network.revision, revision)
+        self.assertNotEqual(self.network.tooling, tooling)
+        before = self.snapshot()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.tool.status(remote=True)
+            self.tool.update(yes=True)
+        self.assertIn("Up to date", output.getvalue())
+        self.assertNotIn("Update available", output.getvalue())
+        self.assertIn("Tooling revision:   " + tooling, output.getvalue())
+        self.assertEqual(before, self.snapshot())
+        self.assertTrue(all("api.github.com" in url for url in self.network.calls))
+        self.assert_no_restart()
+
+    def test_ui_manifest_identity_keeps_tooling_provenance_separate(self):
+        root = self.identity_tree()
+        build = self.root / "manifest-build"
+        (build / "static").mkdir(parents=True)
+        (build / "static/index.html").write_text("frontend unchanged")
+        identity.manifest(root, build, VERSION)
+        before = json.loads((build / "MANIFEST.json").read_text())
+        manager = root / "scripts/agh-patcher.py"
+        manager.write_text(manager.read_text() + "\n# newer manager\n")
+        identity.manifest(root, build, VERSION)
+        after = json.loads((build / "MANIFEST.json").read_text())
+        self.assertEqual(before["patch_revision"], after["patch_revision"])
+        self.assertEqual(before["files"], after["files"])
+        self.assertNotEqual(before["tooling_revision"], after["tooling_revision"])
+
+    def test_installer_migration_removes_old_source_templates_and_updates_tooling_without_restart(self):
+        root = self.identity_tree()
+        directory = root / "install/systemd"
+        directory.mkdir()
+        for name in ("agh-ui-sync.timer", "agh-ui-sync.service"):
+            (directory / name).write_text("old template")
+        (directory / "administrator.service").write_text("keep unrelated template")
+        (root / "ui").mkdir()
+        (root / "ui/custom").write_text("preserve UI parent")
+        self.install_old(legacy=True)
+        self.legacy()
+        frontend_before = {name: value for name, value in self.snapshot().items() if "/build/" in name}
+        p.setup("native", None, None, root, self.paths, self.runner, {})
+        self.assertFalse(list(directory.glob("agh-ui-sync.*")))
+        self.assertTrue((directory / "administrator.service").exists())
+        self.assertTrue((root / "ui/custom").exists())
+        self.assertEqual(self.paths.command.read_bytes(), (root / "scripts/agh-patcher.py").read_bytes())
+        self.assertEqual(p.read_config(self.paths)["tooling_revision"], identity.tooling_revision(root))
+        self.assertEqual(frontend_before, {name: value for name, value in self.snapshot().items() if "/build/" in name})
+        self.assertFalse(list(self.paths.systemd.rglob("agh-ui-sync.*")))
+        self.assertFalse(self.paths.legacy_config.exists())
+        self.assert_no_restart()
+
+    def test_obsolete_source_cleanup_refuses_symlinked_parent(self):
+        root = self.identity_tree()
+        outside = self.root / "outside"
+        outside.mkdir()
+        target = outside / "agh-ui-sync.timer"
+        target.write_text("must not remove outside source")
+        (root / "install/systemd").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(p.Error, "symbolic link"):
+            p.clean_legacy_source(root)
+        self.assertTrue(target.exists())
+
+    @contextlib.contextmanager
+    def durability_trace(self):
+        events = []
+        original_replace, original_directory = p.os.replace, p.fsync_directory
+        original_json, original_tree, original_remove = p.atomic_json, p.sync_tree, p.durable_remove
+        def replace(source, target):
+            original_replace(source, target)
+            events.append(("rename", Path(source), Path(target)))
+        def directory(path):
+            original_directory(path)
+            events.append(("directory", Path(path)))
+        def commit_json(path, data):
+            original_json(path, data)
+            events.append(("json", path, data.get("phase")))
+        def tree(path):
+            original_tree(path)
+            events.append(("tree", path))
+        def remove(path):
+            original_remove(path)
+            events.append(("remove", path))
+        with patch.object(p.os, "replace", side_effect=replace), \
+             patch.object(p, "fsync_directory", side_effect=directory), \
+             patch.object(p, "atomic_json", side_effect=commit_json), \
+             patch.object(p, "sync_tree", side_effect=tree), \
+             patch.object(p, "durable_remove", side_effect=remove):
+            yield events
+
+    def test_json_flushes_file_before_rename_then_parent_directory(self):
+        events = []
+        original_fsync, original_replace = p.os.fsync, p.os.replace
+        def sync(descriptor):
+            events.append("directory" if p.stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+            original_fsync(descriptor)
+        def replace(source, target):
+            events.append("rename")
+            original_replace(source, target)
+        with patch.object(p.os, "fsync", side_effect=sync), patch.object(p.os, "replace", side_effect=replace):
+            p.atomic_json(self.root / "journal.json", {"phase": "prepared"})
+        self.assertEqual(events, ["file", "rename", "directory"])
+
+    def test_durable_file_flush_rejects_special_files_without_blocking(self):
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(p.Error, "non-regular"):
+            p.fsync_file(fifo)
+
+    def test_transaction_data_journal_renames_commit_and_removal_are_durably_ordered(self):
+        self.install_old()
+        journal = self.paths.state / "transaction.json"
+        with self.durability_trace() as events:
+            self.tool.update(yes=True)
+        prepared = events.index(("json", journal, "prepared"))
+        backup_saved = events.index(("json", journal, "backup_saved"))
+        installed = events.index(("json", journal, "installed"))
+        committed = events.index(("json", journal, "committed"))
+        receipt = events.index(("json", self.paths.state / "last-update.json", None))
+        removed = events.index(("remove", journal))
+        backup_move = next(i for i, event in enumerate(events) if event[0] == "rename" and event[1] == self.tool.build)
+        live_move = next(i for i, event in enumerate(events) if event[0] == "rename" and event[2] == self.tool.build)
+        stage_synced = next(i for i, event in enumerate(events) if event[0] == "tree" and event[1].name.startswith(".agh-patcher-stage-"))
+        self.assertLess(stage_synced, prepared)
+        self.assertLess(events.index(("tree", self.tool.build)), prepared)
+        self.assertEqual(events[prepared - 1], ("directory", self.paths.state))
+        self.assertEqual(events[backup_move + 1], ("directory", self.agh))
+        self.assertEqual(events[live_move + 1], ("directory", self.agh))
+        self.assertEqual(events[receipt - 1], ("directory", self.paths.state))
+        self.assertEqual(events[removed - 1], ("directory", self.paths.state))
+        self.assertEqual(sorted((prepared, backup_move, backup_saved, live_move, installed, receipt, committed, removed)),
+                         [prepared, backup_move, backup_saved, live_move, installed, receipt, committed, removed])
+
+    def test_rollback_rename_is_flushed_before_recovery_record_removal(self):
+        self.install_old()
+        self.runner.fail_restarts = 1
+        journal = self.paths.state / "transaction.json"
+        with self.durability_trace() as events:
+            with self.assertRaisesRegex(p.Error, "previous frontend restored"):
+                self.tool.update(yes=True)
+        rollback = next(i for i, event in enumerate(events) if event[0] == "rename" and event[1].name.startswith(".agh-patcher-backup-"))
+        self.assertLess(events.index(("json", journal, "rolling_back")), rollback)
+        self.assertEqual(events[rollback + 1], ("directory", self.agh))
+        self.assertLess(rollback, events.index(("json", journal, "rolled_back")))
+        self.assertLess(events.index(("json", journal, "rolled_back")), events.index(("remove", journal)))
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+
+    def test_staging_flush_failure_preserves_old_frontend_without_restart(self):
+        self.install_old()
+        with patch.object(p, "fsync_file", side_effect=OSError("storage cannot flush staged data")):
+            with self.assertRaisesRegex(p.Error, "previous frontend restored"):
+                self.tool.update(yes=True)
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+        self.assertFalse((self.paths.state / "transaction.json").exists())
+        self.assert_no_restart()
+
+    def test_journal_flush_failure_occurs_before_any_live_rename(self):
+        self.install_old()
+        journal = self.paths.state / "transaction.json"
+        original = p.fsync_directory
+        def fail_prepared(path):
+            if path == self.paths.state and journal.exists() and json.loads(journal.read_text())["phase"] == "prepared":
+                raise OSError("journal parent fsync failed")
+            original(path)
+        with patch.object(p, "fsync_directory", side_effect=fail_prepared):
+            with self.assertRaisesRegex(p.Error, "previous frontend restored"):
+                self.tool.update(yes=True)
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+        self.assert_no_restart()
+
+    def test_failed_directory_flush_after_live_rename_still_restores_previous_build(self):
+        self.install_old()
+        original = p.fsync_directory
+        failed = False
+        def fail_live(path):
+            nonlocal failed
+            if path == self.agh and not failed and self.tool.local(VERSION)[0] == NEW:
+                failed = True
+                raise OSError("live rename directory fsync failed")
+            original(path)
+        with patch.object(p, "fsync_directory", side_effect=fail_live):
+            with self.assertRaisesRegex(p.Error, "previous frontend restored"):
+                self.tool.update(yes=True)
+        self.assertTrue(failed)
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+        self.assertTrue(self.runner.running)
+
+    def test_failed_commit_restores_previous_build_and_success_receipt(self):
+        self.install_old()
+        last_update = self.paths.state / "last-update.json"
+        previous = {"revision": OLD, "backup": None}
+        p.atomic_json(last_update, previous)
+        original = p.atomic_json
+        def fail_commit(path, data):
+            original(path, data)
+            if path.name == "transaction.json" and data.get("phase") == "committed":
+                raise OSError("commit durability failure")
+        with patch.object(p, "atomic_json", side_effect=fail_commit):
+            with self.assertRaisesRegex(p.Error, "previous frontend restored"):
+                self.tool.update(yes=True)
+        self.assertEqual(self.tool.local(VERSION), (OLD, "Healthy"))
+        self.assertEqual(json.loads(last_update.read_text()), previous)
 
     def test_untrusted_config_and_privileged_path_symlinks_are_rejected(self):
         p.atomic_json(self.paths.config, self.config)

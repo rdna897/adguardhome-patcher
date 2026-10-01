@@ -6,12 +6,14 @@ import contextlib
 import fcntl
 import hashlib
 from html.parser import HTMLParser
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -94,16 +96,74 @@ class Network:
             return target.read_bytes()
 
 
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def durable_mkdir(path, mode=0o755):
+    if not path.exists():
+        durable_mkdir(path.parent)
+        path.mkdir(mode=mode)
+        fsync_directory(path)
+        fsync_directory(path.parent)
+
+
+def fsync_file(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise Error(f"Cannot durably stage a non-regular file: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sync_tree(path):
+    """Flush file data, child directories, then the root's parent entry."""
+    safe_directory(path)
+    if not path.is_dir():
+        raise Error(f"Expected a frontend directory to flush: {path}")
+    def walk_error(error):
+        raise error
+    for directory, children, files in os.walk(path, topdown=False, followlinks=False, onerror=walk_error):
+        parent = Path(directory)
+        if any((parent / name).is_symlink() for name in (*children, *files)):
+            raise Error("Refusing a symlink in a durably staged frontend")
+        for name in files:
+            fsync_file(parent / name)
+        fsync_directory(parent)
+    fsync_directory(path.parent)
+
+
+def durable_replace(source, target):
+    os.replace(source, target)
+    fsync_directory(target.parent)
+    if source.parent != target.parent:
+        fsync_directory(source.parent)
+
+
+def durable_remove(path):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+    fsync_directory(path.parent)
+
+
 def atomic_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent)
     temp = path.with_name(path.name + ".new")
     with temp.open("w") as stream:
+        os.fchmod(stream.fileno(), 0o600)
         json.dump(data, stream, indent=2)
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    temp.chmod(0o600)
-    os.replace(temp, path)
+    durable_replace(temp, path)
 
 
 def secure_path(path, owner=0):
@@ -126,16 +186,16 @@ def digest(path):
 def install_file(source, target):
     if target.is_symlink():
         raise Error(f"Refusing a symlinked tooling target: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(target.parent)
     descriptor, name = tempfile.mkstemp(prefix=".agh-patcher-tool-", dir=target.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, "wb") as out, source.open("rb") as original:
+            os.fchmod(out.fileno(), 0o755)
             shutil.copyfileobj(original, out)
             out.flush()
             os.fsync(out.fileno())
-        temporary.chmod(0o755)
-        os.replace(temporary, target)
+        durable_replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -353,9 +413,10 @@ class Patcher:
             status += "; legacy updater artefacts present — rerun installer to disable/remove them"
         self.print_status(version, revision, available, status)
 
-    @staticmethod
-    def print_status(version, revision, available, status):
-        print(f"AdGuard Home:    {version}\nInstalled patch: {revision}\nAvailable patch: {available}\nStatus:          {status}")
+    def print_status(self, version, revision, available, status):
+        tooling = self.config.get("tooling_revision", "Unknown (rerun installer)")
+        print(f"AdGuard Home:       {version}\nFrontend revision:  {revision}\nTooling revision:   {tooling}\n"
+              f"Available frontend: {available}\nStatus:             {status}")
 
     @contextlib.contextmanager
     def lock(self):
@@ -368,7 +429,7 @@ class Patcher:
             secure_path(self.paths.docker_launcher)
             secure_path(self.paths.legacy_config.parent)
             secure_path(self.paths.legacy_command.parent)
-        self.paths.state.mkdir(parents=True, exist_ok=True, mode=0o755)
+        durable_mkdir(self.paths.state)
         if (self.paths.state / "lock").is_symlink():
             raise Error("Refusing a symlinked operation lock")
         with (self.paths.state / "lock").open("a") as lock:
@@ -461,52 +522,80 @@ class Patcher:
 
     def install_verified(self, verified, manifest, archive_sha):
         safe_directory(self.ui)
-        self.ui.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.ui)
         stage = self.ui / (".agh-patcher-stage-" + uuid.uuid4().hex)
         backup = self.ui / (".agh-patcher-backup-" + uuid.uuid4().hex)
         journal = self.paths.state / "transaction.json"
         last_update = self.paths.state / "last-update.json"
         previous_record = json.loads(last_update.read_text()) if last_update.exists() else {}
+        previous_record_exists = last_update.exists()
         had_previous = self.build.exists()
         installed = False
+        commit_attempted = False
+        transaction = {"schema": 1, "phase": "prepared", "backup": str(backup), "stage": str(stage),
+                       "build": str(self.build), "had_previous": had_previous,
+                       "frontend_revision": manifest["patch_revision"]}
         try:
             shutil.copytree(verified, stage)
             (stage / "SHA256").write_text(archive_sha + "\n")
             atomic_json(stage / "INSTALL.json", {"schema": 1, "patch_revision": manifest["patch_revision"],
                                                   "archive_sha256": archive_sha})
-            atomic_json(journal, {"backup": str(backup), "stage": str(stage), "build": str(self.build),
-                                  "had_previous": had_previous})
+            sync_tree(stage)
             if had_previous:
-                os.replace(self.build, backup)
-            os.replace(stage, self.build)
+                sync_tree(self.build)
+            # The staged data and recovery record must be durable before any live rename.
+            atomic_json(journal, transaction)
+            if had_previous:
+                durable_replace(self.build, backup)
+                transaction["phase"] = "backup_saved"
+                atomic_json(journal, transaction)
+            durable_replace(stage, self.build)
             installed = True
+            transaction["phase"] = "installed"
+            atomic_json(journal, transaction)
             self.restart_and_verify()
             if self.version() != manifest["adguard_version"]:
                 raise Error("AdGuard Home version changed during the update")
             if self.local(manifest["adguard_version"]) != (manifest["patch_revision"], "Healthy"):
                 raise Error("Installed frontend failed its file/compatibility check")
+            commit_attempted = True
             atomic_json(last_update, {"backup": str(backup) if had_previous else None,
                                      "revision": manifest["patch_revision"], "archive_sha256": archive_sha})
+            transaction["phase"] = "committed"
+            atomic_json(journal, transaction)
         except BaseException as error:
             try:
+                # A rename may have succeeded before its directory fsync failed.
+                installed = installed or (not stage.exists() and self.build.exists() and journal.exists())
+                if journal.exists():
+                    transaction["phase"] = "rolling_back"
+                    atomic_json(journal, transaction)
                 if installed and self.build.exists():
-                    shutil.rmtree(self.build)
+                    durable_remove(self.build)
                 if backup.exists():
-                    os.replace(backup, self.build)
+                    durable_replace(backup, self.build)
+                if commit_attempted:
+                    if previous_record_exists:
+                        atomic_json(last_update, previous_record)
+                    else:
+                        durable_remove(last_update)
                 if installed:
                     self.restart_and_verify()
-                journal.unlink(missing_ok=True)
+                if stage.exists():
+                    durable_remove(stage)
+                if journal.exists():
+                    transaction["phase"] = "rolled_back"
+                    atomic_json(journal, transaction)
+                    durable_remove(journal)
             except BaseException as recovery:
                 raise Error(f"Update failed ({error}); recovery needs administrator attention ({recovery}). "
-                            f"Retained transaction: {journal}") from error
+                            f"Inspect transaction/recovery paths: {journal}") from error
             raise Error(f"Update failed; previous frontend restored (or stock UI retained): {error}") from error
-        finally:
-            if stage.exists():
-                shutil.rmtree(stage)
-        journal.unlink(missing_ok=True)
         old_backup = previous_record.get("backup")
         if old_backup:
             remove_recorded_backup(Path(old_backup), self.ui)
+        # Commit/obsolete-backup cleanup must reach stable storage before recovery metadata is removed.
+        durable_remove(journal)
         print(f"Installed patch {manifest['patch_revision']}; AdGuard Home is running. Automatic updates are disabled.")
 
     def uninstall(self, yes=False):
@@ -562,7 +651,7 @@ def remove_recorded_backup(path, ui, prefix=".agh-patcher-backup-"):
     if path.parent != ui or not re.fullmatch(re.escape(prefix) + r"[a-f0-9]{32}", path.name) or path.is_symlink():
         raise Error("Refusing an unsafe recorded rollback path")
     if path.exists():
-        shutil.rmtree(path)
+        durable_remove(path)
 
 
 def retire_legacy(paths, runner):
@@ -615,18 +704,36 @@ def legacy_settings(paths):
     return result
 
 
+def clean_legacy_source(source):
+    directory = source / "install/systemd"
+    safe_directory(directory)
+    for name in ("agh-ui-sync.timer", "agh-ui-sync.service"):
+        file = directory / name
+        if file.exists() or file.is_symlink():
+            if file.is_dir() and not file.is_symlink():
+                raise Error(f"Expected an obsolete unit file, not a directory: {file}")
+            durable_remove(file)
+            print(f"Removed obsolete source template: {file}")
+
+
 def setup(mode, repository, container, source, paths=None, runner=None, environ=None):
     paths = paths or Paths()
     runner = runner or Runner()
     environ = environ if environ is not None else os.environ
     if not all((source / "scripts" / name).is_file() for name in ("agh-patcher.py", "agh-launch.sh")):
         raise Error("Run setup through the downloaded repository's install/native or install/docker installer")
+    if paths.root == Path("/"):
+        secure_path(source / "install/systemd")
+    spec = importlib.util.spec_from_file_location("release_identity", source / "scripts/release-manifest.py")
+    identity = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(identity)
     legacy = legacy_settings(paths)
     old = read_config(paths) if paths.config.exists() else {}
     if old and old["mode"] != mode:
         raise Error("Uninstall the existing patcher mode before changing native/Docker mode")
     agh_dir = environ.get("AGH_DIR", old.get("agh_dir", legacy.get("AGH_DIR", "/opt/AdGuardHome")))
     config = {"schema": 1, "mode": mode,
+              "tooling_revision": identity.tooling_revision(source),
               "repository": repository or old.get("repository", legacy.get("GITHUB_REPO", "rdna897/adguardhome-patcher")),
               "ui_root": agh_dir if mode == "native" else environ.get("AGH_UI_ROOT", old.get("ui_root", legacy.get("AGH_UI_ROOT", "/opt/adguardhome-patcher/ui")))}
     if mode == "native":
@@ -650,15 +757,14 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
             raise Error("Invalid AdGuard Home path")
     with patcher.lock():
         retire_legacy(paths, runner)
-        paths.command.parent.mkdir(parents=True, exist_ok=True)
+        clean_legacy_source(source)
         install_file(source / "scripts/agh-patcher.py", paths.command)
         target = Path(agh_dir) / "agh-launch.sh" if mode == "native" else paths.docker_launcher
         if target.is_symlink():
             raise Error("Refusing a symlinked launcher target")
-        target.parent.mkdir(parents=True, exist_ok=True)
         install_file(source / "scripts/agh-launch.sh", target)
         if mode == "docker":
-            patcher.ui.mkdir(parents=True, exist_ok=True)
+            durable_mkdir(patcher.ui)
         atomic_json(paths.config, config)
         paths.config.chmod(0o644)
         if mode == "native":
@@ -669,7 +775,8 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
             override.write_text("# Added by adguardhome-patcher.\n[Service]\nExecStart=\nExecStart=" + command + "\n")
         runner.run("systemctl", "daemon-reload")
     revision, _ = patcher.local(version)
-    print(f"AdGuard Home: {version}\nInstalled patch: {revision}\nAutomatic updates: disabled; no timer installed.\n"
+    print(f"AdGuard Home: {version}\nFrontend revision: {revision}\nTooling revision: {config['tooling_revision']}\n"
+          "Automatic updates: disabled; no timer installed.\n"
           "Status: sudo agh-patcher status\nCheck: sudo agh-patcher check\n"
           "Install/update frontend: sudo agh-patcher update\nUninstall: sudo agh-patcher uninstall")
 
