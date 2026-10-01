@@ -2,9 +2,43 @@
 
 [![build](https://github.com/rdna897/adguardhome-patcher/actions/workflows/build.yml/badge.svg)](https://github.com/rdna897/adguardhome-patcher/actions/workflows/build.yml)
 
-Add a time range selector to the AdGuard Home dashboard: **Default**, **Last 1 / 6 / 12 / 24 hours**, **Today**, **Last 7 days**, **Last 30 days**, and **Custom** hours or days. The selection stays in your browser. Phone screens use a compact two-column chart layout. The existing Query Log also gains a **Live / Paused** troubleshooting mode.
+AdGuard Home Patcher adds frontend-only dashboard improvements to the official AdGuard Home binary or Docker image. It does not modify the AdGuard Home backend, configuration, statistics database, or server Query Log.
 
-The screenshots show a custom 13-hour range with sample statistics. `google.com` and `microsoft.com` are the example blocked domains.
+## Features
+
+### Dashboard time ranges
+
+- **Default**, **Last 1 / 6 / 12 / 24 hours**, **Today**, **Last 7 days**, **Last 30 days**, and **Custom** hour/day ranges.
+- The selected range persists in the browser.
+- Statistics use the existing AdGuard Home statistics API; no backend or binary patch is required.
+- Ranges longer than the configured statistics retention period are disabled.
+- **Today** starts at local midnight in the browser's time zone.
+- Hourly ranges include the current partial hour and preceding full hours.
+- A single bucket is rendered as a flat series with the same hourly tooltip at both ends.
+- Compact two-column statistics charts on phone-sized screens.
+
+### Live Query Log
+
+- **Live / Paused** toggle on the existing Query Log page, with the preference retained in the browser.
+- Live mode polls the existing Query Log API roughly one second after each completed request; there is no WebSocket, backend push stream, or modified AdGuard Home binary.
+- Existing domain/client search and response-status filters continue to work in Live mode.
+- New DNS requests appear automatically while you remain at the newest entries.
+- Scrolling away from the top freezes the visible rows so troubleshooting history does not move underneath you.
+- Incoming entries are queued behind a **new queries ↑** indicator while you read older rows.
+- **Show Newest**/the pending indicator returns to the newest entries; naturally scrolling back to the top also reveals queued arrivals.
+- Client block/unblock row actions preserve queued arrivals and their pending indicator.
+- **Clear view** clears only the browser's current view and never deletes the server Query Log.
+- Hidden tabs suspend polling and resume safely when visible again.
+- Request failures retain the current rows and retry after a five-second back-off.
+- The browser keeps at most **500 displayed rows plus 500 queued arrivals**.
+- Normal paused Query Log refresh and pagination remain available.
+- Desktop and mobile layouts are covered by production-browser validation.
+
+Live Query Log is deliberately a lightweight troubleshooting view rather than a lossless server-pushed stream. Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long request gaps, or time spent in a hidden tab can leave gaps in the live browser view. The authoritative server Query Log remains available through normal **Paused / Refresh** browsing.
+
+## Screenshots
+
+The screenshots show a custom 13-hour range with sample statistics. `google.com` and `microsoft.com` are example blocked domains.
 
 **Desktop**
 
@@ -14,19 +48,19 @@ The screenshots show a custom 13-hour range with sample statistics. `google.com`
 
 <img src="docs/dashboard-mobile.png" alt="Mobile dashboard with two-column charts and example blocked domains" width="390">
 
-The patch runs with the official AdGuard Home binary or Docker image. It changes the frontend only; your configuration, statistics database, and query log stay intact.
-
 ## How it works
 
-GitHub Actions checks for the newest stable AdGuard Home release every six hours. It applies the patch, runs type checking, lint, unit tests, a production build, and a smoke test against the official binary. Successful builds are published as `ui-vX.Y.Z`; failures create an `incompatible` issue.
+GitHub Actions checks for the newest stable AdGuard Home release every six hours. It applies the frontend patch and runs validation regression checks, applied-source whitespace checks, type checking, lint, frontend tests, a production build, browser validation, and a smoke test against the official AdGuard Home binary. Successful builds are published as `ui-vX.Y.Z`; compatibility failures create an `incompatible` issue.
 
-On your Linux host, a systemd timer checks every 15 minutes for the UI matching the installed binary or running container. It verifies the download's SHA-256 checksum, installs it, and restarts AdGuard Home when the UI changes. The launcher enables `--local-frontend` only when `build/VERSION` matches the binary. Otherwise, it starts the stock dashboard.
+Pull requests to `main` validate the exact PR head with read-only permissions. The PR path does not publish releases, modify issues, or receive write-capable checkout credentials. Trusted release/publish jobs remain restricted to this repository's `main` branch and trusted push, schedule, or manual events.
+
+On a Linux host, a systemd timer checks every 15 minutes for UI assets matching the installed native binary or running Docker container. Downloads are SHA-256 verified. The launcher enables `--local-frontend` only when `build/VERSION` matches the AdGuard Home binary; otherwise AdGuard Home starts with its stock dashboard.
 
 ## Native installation
 
-These instructions add the dashboard to an **existing native AdGuard Home installation on Linux with systemd**. For installing AdGuard Home itself, follow the [official getting-started guide](https://adguard-dns.io/kb/adguard-home/getting-started/).
+These instructions add the patched dashboard to an **existing native AdGuard Home installation on Linux with systemd**. For installing AdGuard Home itself, follow the official AdGuard Home getting-started documentation.
 
-The default binary directory is `/opt/AdGuardHome`, and the service is `AdGuardHome.service`. On Debian/Ubuntu, run:
+The default binary directory is `/opt/AdGuardHome`, and the service is `AdGuardHome.service`. On Debian/Ubuntu:
 
 ```sh
 sudo apt update
@@ -55,9 +89,9 @@ For a native installation without systemd, use `scripts/agh-launch.sh` as the se
 
 ## Docker installation
 
-Use the official `adguard/adguardhome` image and keep your existing **work and configuration volumes, ports, and network settings**. The host runs the downloader; the container gets a read-only UI directory and the launcher. The container needs no download tools or Docker socket access. See the [official Docker documentation](https://adguard-dns.io/kb/adguard-home/docker/) for the image's standard paths and ports.
+Use the official `adguard/adguardhome` image and retain your existing **work/configuration volumes, ports, networking, and other required command flags**. The host runs the downloader; the container receives a read-only UI directory and launcher. The container does not need download tools or Docker socket access.
 
-The following steps assume Docker Compose on a Linux host with systemd, an existing running container named `adguardhome`, and a Compose service named `adguardhome`.
+The following assumes Docker Compose on a Linux host with systemd, an existing container named `adguardhome`, and a Compose service named `adguardhome`.
 
 ### 1. Install the host sync
 
@@ -68,7 +102,7 @@ sudo git clone https://github.com/rdna897/adguardhome-patcher.git /opt/adguardho
 sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
 ```
 
-Replace the final `adguardhome` with your container name. The script reads the version from that container, prepares `/opt/adguardhome-patcher/ui`, installs the launcher at `/usr/local/lib/adguardhome-patcher/agh-launch.sh`, and enables the host sync timer.
+Replace the final `adguardhome` with your container name. The script reads that container's version, prepares `/opt/adguardhome-patcher/ui`, installs the launcher at `/usr/local/lib/adguardhome-patcher/agh-launch.sh`, and enables the host sync timer.
 
 ### 2. Add the dashboard override
 
@@ -80,11 +114,11 @@ sudo docker compose -f compose.yaml \
   up -d adguardhome
 ```
 
-Use your actual Compose filename. If the service has a different name, edit the `adguardhome` service key in the override and use that service name in the command. The override preserves the base file's image, volumes, ports, and networking, while changing the working directory and startup wrapper. It sets the official configuration and work paths explicitly; retain any additional command flags you already use.
+Use your actual Compose filename. If the service name differs, edit the service key in the override and use that name in the command. The override preserves the base image, volumes, ports, and networking while changing the working directory/startup wrapper. Retain any additional command flags required by your installation.
 
-The override mounts the **parent UI directory**, so later atomic UI replacements are visible inside the container. The launcher checks the running binary's version before enabling the patched dashboard.
+The override mounts the **parent UI directory**, allowing later atomic UI replacements to become visible inside the container. The launcher verifies the running binary version before enabling the patched dashboard.
 
-For a new installation, a minimal base Compose file is:
+A minimal base Compose example for a new installation is:
 
 ```yaml
 services:
@@ -102,24 +136,7 @@ services:
       - ./conf:/opt/adguardhome/conf
 ```
 
-Start that base file, finish AdGuard Home setup on port 3000, then follow the two steps above. Port 8080 maps the dashboard when AdGuard Home is configured to listen on container port 80. Add the ports you need for encrypted DNS or DHCP following the official documentation. When adapting an existing installation, reuse its data paths instead of creating new empty directories.
-
-If you use `docker run`, install the host sync first, then recreate the container with the launcher. The following example assumes you have already stopped and removed the old container while retaining its data. Replace the two data paths and preserve any additional ports and network options from your original command:
-
-```sh
-sudo docker run -d --name adguardhome --restart unless-stopped \
-  -p 53:53/tcp -p 53:53/udp -p 3000:3000/tcp -p 8080:80/tcp \
-  -v /your/work:/opt/adguardhome/work \
-  -v /your/conf:/opt/adguardhome/conf \
-  -v /usr/local/lib/adguardhome-patcher/agh-launch.sh:/opt/adguardhome-patcher/agh-launch.sh:ro \
-  -v /opt/adguardhome-patcher/ui:/opt/adguardhome/ui:ro \
-  -w /opt/adguardhome/ui \
-  -e AGH_BIN=/opt/adguardhome/AdGuardHome \
-  -e AGH_UI_ROOT=/opt/adguardhome/ui \
-  --entrypoint /bin/sh adguard/adguardhome:latest \
-  /opt/adguardhome-patcher/agh-launch.sh --no-check-update \
-  -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work
-```
+Start the base file, finish AdGuard Home setup on port 3000, then apply the two steps above. Port 8080 maps the dashboard when AdGuard Home listens on container port 80. Add encrypted-DNS or DHCP ports as required. Existing installations should always reuse their existing data paths.
 
 Check the installation:
 
@@ -133,9 +150,9 @@ Look for `agh-launch: using patched dashboard UI for vX.Y.Z`. One host sync conf
 
 ## Updates
 
-Update native AdGuard Home with your usual method. On the next service start, the launcher uses the stock UI if the binary version has changed; the timer installs a matching dashboard when available.
+Update native AdGuard Home normally. If the binary version changes before a matching patched UI exists, the launcher safely uses the stock UI until the timer obtains a compatible build.
 
-For Docker, pull and recreate the container using **both Compose files**:
+For Docker, pull and recreate the service using **both Compose files**:
 
 ```sh
 sudo docker compose -f compose.yaml \
@@ -145,9 +162,9 @@ sudo docker compose -f compose.yaml \
 sudo /usr/local/bin/agh-ui-sync.sh
 ```
 
-Update the image tag in your base file first if you pin a version. The launcher and timer handle the UI version independently. Refresh the browser after a dashboard update.
+Update the image tag in the base file first if you pin versions. Refresh the browser after a dashboard update.
 
-To update the host scripts, update your checkout and rerun the appropriate installer. If a build is missing for an older AdGuard Home version, run **Actions → build → Run workflow** with that version's tag.
+To update the host scripts, update this repository checkout and rerun the appropriate installer. If a build is missing for an older supported AdGuard Home version, use **Actions → build → Run workflow** with that version tag.
 
 ## Uninstall
 
@@ -157,45 +174,32 @@ For a native installation:
 sudo sh /opt/adguardhome-patcher/install/native/uninstall.sh
 ```
 
-Use `sudo env AGH_DIR=/your/AdGuardHome sh ...` if you installed into another binary directory. This removes the service override, sync timer, launcher, and downloaded UI, then restarts the stock service.
+Use `sudo env AGH_DIR=/your/AdGuardHome sh ...` if installed elsewhere. This removes the service override, sync timer, launcher, and downloaded UI, then restarts the stock service.
 
-For Docker, first recreate the container with the **base Compose file only**, explicitly forcing recreation to restore the original entrypoint:
+For Docker, first recreate the container with the **base Compose file only** so the original entrypoint is restored:
 
 ```sh
 sudo docker compose -f compose.yaml up -d --force-recreate adguardhome
 sudo sh /opt/adguardhome-patcher/install/docker/uninstall.sh
 ```
 
-Your work and configuration volumes are retained. The host UI and launcher files remain available for reuse; after removing their mounts, you can delete `/opt/adguardhome-patcher/ui` and `/usr/local/lib/adguardhome-patcher` if you no longer need them.
+Work and configuration volumes are retained. After removing the patcher mounts, the downloaded UI and launcher files can also be deleted if no longer required.
 
-## Time ranges
+## Building and validation
 
-- Statistics use hourly buckets: **Last 1 hour** is the current partial hour; longer hourly ranges include it and the preceding full hours.
-- A single bucket is drawn flat with the same hourly tooltip at both ends.
-- **Today** starts at local midnight in the browser's time zone.
-- Ranges longer than your statistics retention setting are disabled.
-- Absolute start/end ranges require backend changes and are not included.
-- The range selector uses English strings added at runtime.
-
-## Live Query Log
-
-On the existing Query Log page, click **Paused** to enable **Live**, or click **Live** to pause. The preference stays in this browser, and the existing domain/client search and status filters continue to apply.
-
-Live mode polls the existing Query Log API about once per second after each completed request; it uses no WebSocket, backend push stream, or modified AdGuard Home binary. Hidden tabs suspend polling. Failed requests keep the displayed entries and retry after five seconds.
-
-While you are reading older rows, arrivals wait behind a **new queries ↑** button. Click it to return to the newest entries; scrolling back to the top also reveals them. Client block/unblock row actions preserve queued arrivals and their indicator. The browser keeps at most **500 displayed rows and 500 queued arrivals**, without changing server storage. **Clear view** clears only this browser view, keeping the server query log intact. Use Refresh to reload the saved log; changing filters also starts a new filtered view.
-
-Each poll reads up to 100 newest matching records. Bursts exceeding that page size between polls, long requests completing outside the retained time window, or time spent in a hidden tab can leave gaps in this troubleshooting view; the server log remains available through the normal paused/Refresh view. Added control labels fall back to English, like the dashboard range selector.
-
-## Building and changing the patch
-
-Requires Node.js 22, Python 3, git, curl, tar, and sudo when the smoke test needs elevated permissions. Python is used only for the build validation regression checks.
+The current patch base is defined by `patch/PATCH_BASE`. Building requires Node.js 22, Python 3, git, curl, tar, and sudo when the smoke test needs elevated permissions.
 
 ```sh
 scripts/build-release.sh v0.107.79
 ```
 
-PR validation also runs the production UI at desktop and mobile viewport sizes, using mocked API responses, controlled visibility events, and browser timers. Run the same complete gate locally with `BROWSER_TEST=1 scripts/build-release.sh v0.107.79`; it installs headless Chromium and its system dependencies unless `PLAYWRIGHT_CHROMIUM_EXECUTABLE` points to an existing browser. The checks cover Live/Paused, pending arrivals through client block/unblock, Show Newest, browser-only clearing, filters, visibility, failure recovery, paused pagination, and navigation cleanup.
+For the complete browser-inclusive gate:
+
+```sh
+BROWSER_TEST=1 scripts/build-release.sh v0.107.79
+```
+
+The gate verifies patch application, validation regressions, staged and unstaged applied-source whitespace, type checking, lint, frontend tests, production webpack output, desktop/mobile Live Query Log behaviour, and the official AdGuard Home binary smoke test. Release output includes the patched UI archive and checksum plus a corresponding source archive containing the patched upstream source, licence, patch, and build/install scripts.
 
 To edit the frontend patch:
 
@@ -208,14 +212,8 @@ git add -N client
 git diff --binary -- client ':!client/node_modules' > ../patch/dashboard-range.patch
 ```
 
-Pull requests to `main` validate their exact head SHA against the supported release in `patch/PATCH_BASE` (currently v0.107.79), using the same build script. The PR job has only `contents: read`, disables persisted checkout credentials, and does not publish releases, upload release artifacts, or modify issues. It uses `pull_request`, never `pull_request_target`.
+Blank unified-patch context lines require a space, so `patch/dashboard-range.patch` has a narrowly scoped `blank-at-eol` exemption. The build independently checks both staged and unstaged **applied source** with Git's trailing-space, blank-EOF, and space-before-tab checks. Regression tests verify malformed applied source fails validation.
 
-The gate checks both staged and unstaged applied source with `git diff --check`: three-way patch application stages changes, so a working-tree check alone is insufficient. Only trailing-whitespace checks on `patch/dashboard-range.patch` are exempt because blank context lines require a space; other patch checks remain enabled, and applied source is checked with the normal trailing-space, blank-EOF, and space-before-tab rules. Regression checks ensure malformed staged or unstaged source fails even when its patch artifact is exempt.
+## Licence
 
-Trusted `main` builds still run every six hours, on pushes, and on manual dispatch. Pinned actions and read access during builds are followed by a separate publishing job guarded by the repository, `main` ref, and trusted event types. No repository secrets are required. Enable Actions and Issues; watch this repository's issues for compatibility reports.
-
-Releases include the UI archive, its checksum, and a corresponding source archive with the patched upstream code, license, and this project's build and installation scripts under `patcher/`.
-
-## License
-
-[GPL-3.0](LICENSE), matching [AdGuard Home](https://github.com/AdguardTeam/AdGuardHome). This project modifies the frontend and is not an official AdGuard product. Upstream copyright notices are preserved in the source archives.
+[GPL-3.0](LICENSE), matching AdGuard Home. This project modifies the frontend and is not an official AdGuard product. Upstream copyright notices are preserved in the source archives.
