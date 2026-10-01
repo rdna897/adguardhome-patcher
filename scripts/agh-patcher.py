@@ -726,7 +726,13 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
         raise Error("Run setup through the released tools bundle's install/native or install/docker installer")
     spec = importlib.util.spec_from_file_location("release_identity", source / "scripts/release-manifest.py")
     identity = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(identity)
+    # Import verification code without writing a cache into an unverified bundle.
+    bytecode_setting = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(identity)
+    finally:
+        sys.dont_write_bytecode = bytecode_setting
     try:
         released = identity.verify_tools(source)
     except (OSError, ValueError) as error:
