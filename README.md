@@ -46,7 +46,9 @@ The screenshots show a custom 13-hour range with sample statistics. `google.com`
 
 **Mobile**
 
-<img src="docs/dashboard-mobile.png" alt="Mobile dashboard with two-column charts and example blocked domains" width="390">
+<img src="docs/dashboard-mobile.png" alt="Mobile dashboard viewport with a custom 13-hour range and two-column charts" width="390">
+
+The mobile screenshot shows one visible screen. Scroll down in the dashboard to see the client and domain tables.
 
 ## How it works
 
@@ -56,16 +58,30 @@ Pull requests to `main` validate the exact PR head with read-only permissions. T
 
 On a Linux host, a systemd timer checks every 15 minutes for UI assets matching the installed native binary or running Docker container. Downloads are SHA-256 verified. The launcher enables `--local-frontend` only when `build/VERSION` matches the AdGuard Home binary; otherwise AdGuard Home starts with its stock dashboard.
 
+## Download the installer (no Git required)
+
+For either native or Docker installation, download the repository archive on your **Linux host**. On Debian/Ubuntu:
+
+```sh
+sudo apt update
+sudo apt install -y curl ca-certificates tar
+patcher_archive=$(mktemp)
+curl -fL --retry 2 https://github.com/rdna897/adguardhome-patcher/archive/refs/heads/main.tar.gz \
+  -o "$patcher_archive"
+sudo mkdir -p /opt/adguardhome-patcher
+sudo tar -xzf "$patcher_archive" --strip-components=1 -C /opt/adguardhome-patcher
+rm -f "$patcher_archive"
+```
+
+Then follow the native or Docker steps below. Extracting this archive also works over an existing patcher installation and preserves its downloaded `ui/` directory. Git is needed only if you want to develop or build the patch yourself.
+
 ## Native installation
 
 These instructions add the patched dashboard to an **existing native AdGuard Home installation on Linux with systemd**. For installing AdGuard Home itself, follow the official AdGuard Home getting-started documentation.
 
-The default binary directory is `/opt/AdGuardHome`, and the service is `AdGuardHome.service`. On Debian/Ubuntu:
+The default binary directory is `/opt/AdGuardHome`, and the service is `AdGuardHome.service`. After downloading the installer above, run:
 
 ```sh
-sudo apt update
-sudo apt install -y git curl ca-certificates
-sudo git clone https://github.com/rdna897/adguardhome-patcher.git /opt/adguardhome-patcher
 sudo sh /opt/adguardhome-patcher/install/native/install.sh
 ```
 
@@ -95,10 +111,9 @@ The following assumes Docker Compose on a Linux host with systemd, an existing c
 
 ### 1. Install the host sync
 
+After downloading the installer above, run on the Docker host:
+
 ```sh
-sudo apt update
-sudo apt install -y git curl ca-certificates
-sudo git clone https://github.com/rdna897/adguardhome-patcher.git /opt/adguardhome-patcher
 sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
 ```
 
@@ -150,6 +165,33 @@ Look for `agh-launch: using patched dashboard UI for vX.Y.Z`. One host sync conf
 
 ## Updates
 
+### Update the patched dashboard
+
+For an existing native or Docker installation, run this on the **Linux host**:
+
+```sh
+sudo /usr/local/bin/agh-ui-sync.sh
+```
+
+The sync script downloads the newest UI build matching your installed AdGuard Home version, verifies its SHA-256 checksum, and restarts the service or container if the build changed. It uses `/etc/default/agh-ui-sync` to select your installation. The timer also checks automatically every 15 minutes; an already-current build exits without restarting.
+
+Hard-refresh the dashboard after an update. On mobile, close and reopen the tab if it still shows the old UI. A dashboard-only update does not require reinstalling AdGuard Home or pulling a new Docker image.
+
+### Update the host scripts
+
+Repeat **Download the installer (no Git required)** above to replace the patcher's files, then rerun the installer for your existing installation:
+
+```sh
+# Native: use the same AGH_DIR as your original installation, if customized.
+sudo sh /opt/adguardhome-patcher/install/native/install.sh
+# Or Docker: use your existing container name.
+sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
+```
+
+Run only the command for your installation. If you customized the Compose override, retain those settings when downloading the new files; the archive replaces the supplied override. AdGuard Home data volumes and the downloaded `ui/` directory are preserved.
+
+### Update AdGuard Home
+
 Update native AdGuard Home normally. If the binary version changes before a matching patched UI exists, the launcher safely uses the stock UI until the timer obtains a compatible build.
 
 For Docker, pull and recreate the service using **both Compose files**:
@@ -164,7 +206,7 @@ sudo /usr/local/bin/agh-ui-sync.sh
 
 Update the image tag in the base file first if you pin versions. Refresh the browser after a dashboard update.
 
-To update the host scripts, update this repository checkout and rerun the appropriate installer. If a build is missing for an older supported AdGuard Home version, use **Actions → build → Run workflow** with that version tag.
+If a build is missing for an older supported AdGuard Home version, use **Actions → build → Run workflow** with that version tag.
 
 ## Uninstall
 
