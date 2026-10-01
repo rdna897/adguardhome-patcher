@@ -224,18 +224,33 @@ index 0000000..b660f72
 +});
 diff --git a/client/src/__tests__/queryLogsRequests.test.ts b/client/src/__tests__/queryLogsRequests.test.ts
 new file mode 100644
-index 0000000..2384824
+index 0000000..37c936f
 --- /dev/null
 +++ b/client/src/__tests__/queryLogsRequests.test.ts
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,142 @@
 +import { beforeEach, describe, expect, it, vi } from 'vitest';
-+import { createStore } from 'redux';
++import { applyMiddleware, combineReducers, createStore } from 'redux';
++import thunk from 'redux-thunk';
 +
 +import apiClient from '../api/Api';
 +import queryLogs from '../reducers/queryLogs';
-+import { getLogs, getLogsSuccess, resetLogsView, setFilteredLogs, setLiveLogsEnabled } from '../actions/queryLogs';
++import access from '../reducers/access';
++import { toggleClientBlock } from '../actions/access';
++import {
++    getLogs, getLogsRequest, getLogsSuccess, receiveLiveLogs, resetLogsView,
++    revealPendingLogs, setFilteredLogs, setLiveLogsEnabled, updateLogs,
++} from '../actions/queryLogs';
++import { normalizeLogs } from '../helpers/helpers';
 +
-+vi.mock('../api/Api', () => ({ default: { getQueryLog: vi.fn() } }));
++vi.mock('../api/Api', () => ({
++    default: { getQueryLog: vi.fn(), getAccessList: vi.fn(), setAccessList: vi.fn() },
++}));
++
++const rawRow = (id: number) => ({
++    time: `2026-10-01T12:00:00.${String(id).padStart(9, '0')}Z`, client: '192.0.2.10',
++    question: { name: 'google.com', type: 'A' }, reason: 'FilteredBlackList', status: 'NXDOMAIN',
++    answer: [], rules: [], elapsedMs: '0.01',
++});
 +
 +const makeStore = () => {
 +    const store = createStore(queryLogs);
@@ -285,6 +300,75 @@ index 0000000..2384824
 +        await dispatch(getLogs());
 +        expect(apiClient.getQueryLog).not.toHaveBeenCalled();
 +    });
++
++    it.each([false, true])('preserves paused row-refresh behaviour with populated rows: %s', async (populated) => {
++        const { store, dispatch } = makeStore();
++        const logs = populated ? normalizeLogs([rawRow(1)]) : [];
++        dispatch(getLogsSuccess({ logs, oldest: rawRow(1).time, older_than: '' }));
++        dispatch(getLogsRequest());
++        await dispatch(updateLogs());
++        expect(store.getState().logs).toBe(logs);
++        expect(store.getState().oldest).toBe(rawRow(1).time);
++        expect(store.getState().processingGetLogs).toBe(false);
++        expect(store.getState().isEntireLog).toBe(!populated);
++        expect(apiClient.getQueryLog).not.toHaveBeenCalled();
++    });
++
++    it.each([false, true])('keeps queued queries through client block/unblock (initially blocked: %s)', async (blocked) => {
++        const store = createStore(combineReducers({ queryLogs, access }), applyMiddleware(thunk));
++        const dispatch: any = store.dispatch;
++        dispatch(getLogsSuccess({ logs: normalizeLogs([rawRow(1)]), oldest: rawRow(1).time, older_than: '' }));
++        dispatch(setLiveLogsEnabled(true));
++        dispatch(receiveLiveLogs({ logs: normalizeLogs([rawRow(2), rawRow(1)]), atTop: false }));
++        const before = store.getState().queryLogs;
++        vi.mocked(apiClient.getAccessList).mockResolvedValue({
++            allowed_clients: [], disallowed_clients: blocked ? ['192.0.2.10'] : [], blocked_hosts: [],
++        });
++        vi.mocked(apiClient.setAccessList).mockResolvedValue(undefined);
++        await dispatch(toggleClientBlock('192.0.2.10', blocked, blocked ? '192.0.2.10' : ''));
++        await dispatch(updateLogs());
++        const after = store.getState().queryLogs;
++        expect(after).toEqual(before);
++        expect(after.logs).toBe(before.logs);
++        expect(after.livePending).toBe(before.livePending);
++        expect(after.livePending).toHaveLength(1);
++        expect(after.liveSeen).toBe(before.liveSeen);
++        expect(after.liveNewest).toBe(before.liveNewest);
++        expect(after.liveFloor).toBe(before.liveFloor);
++        expect(store.getState().access.disallowed_clients).toBe(blocked ? '' : '192.0.2.10');
++        dispatch(receiveLiveLogs({ logs: normalizeLogs([rawRow(2), rawRow(1)]), atTop: false }));
++        expect(store.getState().queryLogs.livePending).toHaveLength(1);
++        dispatch(revealPendingLogs());
++        expect(store.getState().queryLogs.logs.map((row: any) => row.time)).toEqual([rawRow(2).time, rawRow(1).time]);
++        expect(store.getState().queryLogs.livePending).toHaveLength(0);
++        expect(apiClient.getQueryLog).not.toHaveBeenCalled();
++    });
++
++    it('does not complete an active Live filter request when a row refresh finishes', async () => {
++        const { store, dispatch } = makeStore();
++        dispatch(setLiveLogsEnabled(true));
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        const request = dispatch(setFilteredLogs({ search: 'microsoft.com', response_status: 'blocked' }));
++        await dispatch(updateLogs());
++        expect(store.getState().processingGetLogs).toBe(true);
++        resolve({ data: [], oldest: '' });
++        await request;
++        expect(store.getState().processingGetLogs).toBe(false);
++        expect(store.getState().filter.search).toBe('microsoft.com');
++    });
++
++    it('still appends normal paused pagination and advances its server cursor', async () => {
++        const { store, dispatch } = makeStore();
++        dispatch(getLogsSuccess({ logs: normalizeLogs([rawRow(2)]), oldest: rawRow(2).time, older_than: '' }));
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue({ data: [rawRow(1)], oldest: rawRow(1).time });
++        await dispatch(getLogs());
++        expect(apiClient.getQueryLog).toHaveBeenCalledWith(
++            { ...store.getState().filter, older_than: rawRow(2).time }, expect.any(AbortSignal),
++        );
++        expect(store.getState().logs.map((row: any) => row.time)).toEqual([rawRow(2).time, rawRow(1).time]);
++        expect(store.getState().oldest).toBe(rawRow(1).time);
++    });
 +});
 diff --git a/client/src/__tests__/statsRange.test.ts b/client/src/__tests__/statsRange.test.ts
 new file mode 100644
@@ -329,10 +413,10 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..39bd372
+index 0000000..b5f7405
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,266 @@
 +import React, { useRef } from 'react';
 +import ReactDOM from 'react-dom';
 +import { act } from 'react-dom/test-utils';
@@ -341,7 +425,7 @@ index 0000000..39bd372
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import apiClient from '../api/Api';
-+import { getLogsRequest, getLogsSuccess, setLogsFilter } from '../actions/queryLogs';
++import { getLogsRequest, getLogsSuccess, setLogsFilter, updateLogs } from '../actions/queryLogs';
 +import queryLogs from '../reducers/queryLogs';
 +import { useLiveQueryLog } from '../components/Logs/useLiveQueryLog';
 +import { LIVE_LOG_STORAGE_KEY } from '../helpers/liveQueryLog';
@@ -557,6 +641,11 @@ index 0000000..39bd372
 +        expect(controls.pendingCount).toBe(1);
 +        expect(store.getState().queryLogs.logs).toBe(visibleRows);
 +        expect(element.scrollIntoView).not.toHaveBeenCalled();
++        const queuedState = store.getState().queryLogs;
++        act(() => { store.dispatch(updateLogs()); });
++        expect(controls.pendingCount).toBe(1);
++        expect(store.getState().queryLogs).toEqual(queuedState);
++        expect(store.getState().queryLogs.livePending).toBe(queuedState.livePending);
 +        act(() => controls.showNewest());
 +        expect(element.scrollIntoView).toHaveBeenCalledTimes(1);
 +        expect(controls.pendingCount).toBe(0);
@@ -595,7 +684,7 @@ index 0000000..39bd372
 +    });
 +});
 diff --git a/client/src/actions/queryLogs.ts b/client/src/actions/queryLogs.ts
-index 70dc568..0fc3be0 100644
+index 70dc568..1711924 100644
 --- a/client/src/actions/queryLogs.ts
 +++ b/client/src/actions/queryLogs.ts
 @@ -7,12 +7,21 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
@@ -667,7 +756,7 @@ index 70dc568..0fc3be0 100644
          }
      }
  
-@@ -67,6 +86,17 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
+@@ -67,49 +86,45 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
      return totalData;
  };
  
@@ -685,8 +774,27 @@ index 70dc568..0fc3be0 100644
  export const toggleDetailedLogs = createAction('TOGGLE_DETAILED_LOGS');
  
  export const getLogsRequest = createAction('GET_LOGS_REQUEST');
-@@ -91,25 +121,24 @@ export const updateLogs = () => async (dispatch: any, getState: any) => {
- };
+ export const getLogsFailure = createAction('GET_LOGS_FAILURE');
+ export const getLogsSuccess = createAction('GET_LOGS_SUCCESS');
+ 
+-export const updateLogs = () => async (dispatch: any, getState: any) => {
+-    try {
+-        const { logs, oldest, older_than } = getState().queryLogs;
+-
+-        dispatch(
+-            getLogsSuccess({
+-                logs,
+-                oldest,
+-                older_than,
+-            }),
+-        );
+-    } catch (error) {
+-        dispatch(addErrorToast({ error }));
+-        dispatch(getLogsFailure(error));
+-    }
+-};
++// Row actions refresh local presentation; they are not new server log results.
++export const updateLogs = createAction('UPDATE_LOGS');
  
  export const getLogs = (currentQuery?: string) => async (dispatch: any, getState: any) => {
 +    const { isFiltered, filter, oldest, processingGetLogs, liveEnabled } = getState().queryLogs;
@@ -725,7 +833,7 @@ index 70dc568..0fc3be0 100644
      }
  };
  
-@@ -129,27 +158,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
+@@ -129,27 +144,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
  export const setFilteredLogsSuccess = createAction('SET_FILTERED_LOGS_SUCCESS');
  
  export const setFilteredLogs = (filter?: SearchFormValues) => async (dispatch: any) => {
@@ -2001,10 +2109,10 @@ index 7cc2855..c4c04ab 100644
          processingClear: false,
          processingGetConfig: false,
 diff --git a/client/src/reducers/queryLogs.ts b/client/src/reducers/queryLogs.ts
-index 7a05928..48504b2 100644
+index 7a05928..997972d 100644
 --- a/client/src/reducers/queryLogs.ts
 +++ b/client/src/reducers/queryLogs.ts
-@@ -1,10 +1,46 @@
+@@ -1,10 +1,52 @@
  import { handleActions } from 'redux-actions';
  
 +import { createLiveLogView, mergeLiveLogView, revealLiveLogs } from '../helpers/liveQueryLog';
@@ -2014,6 +2122,12 @@ index 7a05928..48504b2 100644
  
  const queryLogs = handleActions(
      {
++        [actions.updateLogs.toString()]: (state: any) => ({
++            ...state,
++            // Preserve the live window and any active filter/server request.
++            isEntireLog: state.liveEnabled ? state.isEntireLog : state.logs.length < 1,
++            processingGetLogs: state.liveEnabled ? state.processingGetLogs : false,
++        }),
 +        [actions.setLiveLogsEnabled.toString()]: (state: any, { payload }: any) => {
 +            if (!payload) {
 +                return { ...state, liveEnabled: false };
@@ -2051,7 +2165,7 @@ index 7a05928..48504b2 100644
          [actions.setFilteredLogsRequest.toString()]: (state: any) => ({
              ...state,
              processingGetLogs: true,
-@@ -28,7 +64,7 @@ const queryLogs = handleActions(
+@@ -28,7 +70,7 @@ const queryLogs = handleActions(
                  oldest,
                  filter,
                  isFiltered,
@@ -2060,7 +2174,7 @@ index 7a05928..48504b2 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -50,10 +86,11 @@ const queryLogs = handleActions(
+@@ -50,10 +92,11 @@ const queryLogs = handleActions(
          [actions.getLogsSuccess.toString()]: (state: any, { payload }: any) => {
              const { logs, oldest, older_than } = payload;
  
@@ -2073,7 +2187,7 @@ index 7a05928..48504b2 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -129,6 +166,11 @@ const queryLogs = handleActions(
+@@ -129,6 +172,11 @@ const queryLogs = handleActions(
          processingAdditionalLogs: false,
          interval: DAY,
          logs: [],
