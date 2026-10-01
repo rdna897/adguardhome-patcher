@@ -97,7 +97,8 @@ class FakeRunner:
         self.unhealthy_restarts = 0
         self.mounts = []
         self.labels = {}
-        self.image_command = []
+        self.effective_command = []
+        self.image_id = "sha256:" + "a" * 64
         self.version = VERSION
 
     def run(self, *args, check=True):
@@ -118,12 +119,11 @@ class FakeRunner:
                 self.running = True
         elif args[:2] == ("systemctl", "is-active"):
             code = 0 if self.running else 1
-        elif args[:3] == ("docker", "image", "inspect"):
-            stdout = json.dumps(self.image_command)
         elif args[:2] == ("docker", "inspect"):
             values = {"{{json .Mounts}}": self.mounts, "{{json .Config.Labels}}": self.labels,
-                      "{{json .State}}": {"Running": self.running}}
-            stdout = "sha256:" + "a" * 64 if args[3] == "{{.Image}}" else json.dumps(values[args[3]])
+                      "{{json .State}}": {"Running": self.running},
+                      "{{json .Config.Cmd}}": self.effective_command}
+            stdout = self.image_id if args[3] == "{{.Image}}" else json.dumps(values[args[3]])
         result = SimpleNamespace(returncode=code, stdout=stdout, stderr="fixture failure" if code else "")
         if check and code:
             raise p.Error("restart failed")
@@ -588,10 +588,11 @@ class ManualPatcher(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
     def test_docker_compose_preserves_base_command_and_administrator_settings(self):
-        self.runner.image_command = ["--no-check-update", "-c", "/image/config.yaml", "-w", "/image/work"]
-        tool = self.setup_docker("agh-container", "dns")
         arguments = ["--no-check-update", "-c", "/custom/config.yaml", "-w", "/custom/work",
-                     "--extra-test-option", "argument with spaces", 'literal $HOME "quoted"']
+                     "--extra-test-option", "argument with spaces", "", 'literal $HOME "quoted"']
+        self.runner.effective_command = arguments
+        tool = self.setup_docker("agh-container", "dns")
+        self.assertEqual(tool.config["docker_effective_command"], arguments)
         base = {"services": {"dns": {
             "image": "adguard/adguardhome:v0.107.79", "container_name": "agh-container",
             "command": [arg.replace("$", "$$") for arg in arguments],
@@ -608,14 +609,16 @@ class ManualPatcher(unittest.TestCase):
         self.assertEqual(effective["environment"]["ADMIN_SETTING"], "preserved")
         self.assertEqual(effective["labels"]["org.example.admin"], "preserved")
         self.assertEqual(effective["labels"][p.DOCKER_OVERRIDE_LABEL], tool.config["docker_override_revision"])
+        self.assertEqual(self.run_launcher_entrypoint(effective, []), arguments)
+        self.assertEqual(self.run_launcher_entrypoint(effective, arguments), arguments)
         for volume in original["volumes"]:
             self.assertIn(volume, effective["volumes"])
         self.assertNotIn("command", json.loads(self.paths.docker_override.read_text())["services"]["dns"])
         self.assert_no_restart()
 
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
-    def test_docker_compose_without_command_keeps_image_arguments_as_entrypoint_fallback(self):
-        self.runner.image_command = ["-c", '/image/conf $HOME "quoted".yaml', "-w", "/image/work with spaces"]
+    def test_docker_compose_without_command_keeps_inherited_base_arguments_as_fallback(self):
+        self.runner.effective_command = ["-c", '/image/conf $HOME "quoted".yaml', "-w", "/image/work with spaces", ""]
         self.setup_docker("agh-container", "dns")
         base = {"services": {"dns": {"image": "adguard/adguardhome:v0.107.79"}}}
         original = self.compose_config(base)
@@ -624,7 +627,7 @@ class ManualPatcher(unittest.TestCase):
         self.assertIsNone(effective.get("command"))
         self.assertNotIn("command", json.loads(self.paths.docker_override.read_text())["services"]["dns"])
         self.assertNotIn("--no-check-update", effective["entrypoint"][2])
-        self.assertEqual(self.run_launcher_entrypoint(effective, []), self.runner.image_command)
+        self.assertEqual(self.run_launcher_entrypoint(effective, []), self.runner.effective_command)
         supplied = ["-c", "/admin/config.yaml", "-w", "/admin/work", "--verbose"]
         self.assertEqual(self.run_launcher_entrypoint(effective, supplied), supplied)
         self.assert_no_restart()
@@ -658,20 +661,21 @@ class ManualPatcher(unittest.TestCase):
         self.assertEqual(self.run_launcher_entrypoint(service, args, patched=True), ["--local-frontend", *args])
         self.assert_no_restart()
 
-    def test_docker_image_command_validation_precedes_mutation(self):
+    def test_docker_effective_command_validation_precedes_mutation(self):
         for command in ("not-an-array", [None], ["nul\0argument"]):
-            self.runner.image_command = command
+            self.runner.effective_command = command
             before = self.snapshot()
-            with self.assertRaisesRegex(p.Error, "Invalid Docker image command"):
+            with self.assertRaisesRegex(p.Error, "Invalid Docker effective command"):
                 self.setup_docker()
             self.assertEqual(self.snapshot(), before)
         self.assert_no_restart()
 
-    def test_docker_image_default_change_updates_fingerprint_and_requires_activation(self):
+    def test_docker_base_command_change_updates_fingerprint_and_requires_activation(self):
         tool = self.setup_docker()
         self.apply_docker_override()
         old = self.paths.docker_override.read_bytes()
-        self.runner.image_command = ["-c", "/new-image/config.yaml"]
+        self.runner.labels.pop(p.DOCKER_OVERRIDE_LABEL)
+        self.runner.effective_command = ["-c", "/new-base/config.yaml"]
         p.setup("docker", None, None, self.source, self.paths, self.runner, {})
         tool = p.Patcher(p.read_config(self.paths), self.paths, self.runner, self.network)
         self.assertNotEqual(old, self.paths.docker_override.read_bytes())
@@ -679,6 +683,46 @@ class ManualPatcher(unittest.TestCase):
         self.apply_docker_override()
         self.assertEqual(tool.tooling_health(), "Healthy")
         self.assert_no_restart()
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is needed for effective configuration checks")
+    def test_docker_explicit_empty_base_command_keeps_empty_fallback(self):
+        # An image could have nonempty defaults; only the base container is read.
+        self.runner.effective_command = []
+        tool = self.setup_docker("agh-container", "dns")
+        self.assertEqual(tool.config["docker_effective_command"], [])
+        self.assertEqual(tool.config["docker_image_id"], self.runner.image_id)
+        base = {"services": {"dns": {"image": "adguard/adguardhome:v0.107.79", "command": []}}}
+        effective = self.compose_config(base, managed=True)
+        self.assertEqual(effective["command"], [])
+        self.assertEqual(self.run_launcher_entrypoint(effective, []), [])
+        self.assertFalse(any(call[:3] == ("docker", "image", "inspect") for call in self.runner.calls))
+        self.assert_no_restart()
+
+    def test_docker_image_id_drift_is_stale_until_base_reinstall_and_explicit_activation(self):
+        self.runner.effective_command = ["-c", "/old/config.yaml"]
+        tool = self.setup_docker()
+        self.apply_docker_override()
+        self.network.tooling = tool.config["tooling_revision"]
+        self.runner.image_id = "sha256:" + "b" * 64
+        before = self.snapshot()
+        with contextlib.redirect_stdout(output := io.StringIO()):
+            tool.status(remote=True)
+        self.assertIn("Managed Docker override is stale for the current image", output.getvalue())
+        self.assertNotIn("tooling up to date", output.getvalue())
+        with self.assertRaisesRegex(p.Error, "base Compose file only"):
+            p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        self.assertEqual(self.snapshot(), before)
+        self.runner.labels.pop(p.DOCKER_OVERRIDE_LABEL)
+        self.runner.effective_command = ["-c", "/new/config.yaml"]
+        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        tool = p.Patcher(p.read_config(self.paths), self.paths, self.runner, self.network)
+        self.assertEqual(tool.config["docker_image_id"], self.runner.image_id)
+        self.assertEqual(tool.config["docker_effective_command"], self.runner.effective_command)
+        self.assertIn("not active", tool.tooling_health())
+        self.apply_docker_override()
+        self.assertEqual(tool.tooling_health(), "Healthy")
+        self.assert_no_restart()
+        self.assertFalse(any(call[:2] == ("docker", "compose") for call in self.runner.calls))
 
     def test_docker_service_defaults_to_compose_label(self):
         self.runner.labels = {"com.docker.compose.service": "dns-resolver"}
@@ -749,12 +793,17 @@ class ManualPatcher(unittest.TestCase):
         self.assertFalse(any(command[:2] == ("docker", "compose") for command in self.runner.calls))
 
     def test_docker_manager_only_reinstall_preserves_active_override_without_restart(self):
+        self.runner.effective_command = ["-c", "/custom/config.yaml", "", "two words"]
         self.setup_docker()
         self.apply_docker_override()
         before = self.paths.docker_override.read_bytes()
         before_stat = self.paths.docker_override.stat()
         released = self.update_released_tools(change_template=False)
-        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        for command in (None, []):
+            with self.subTest(active_command=command):
+                self.runner.effective_command = command
+                p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+                self.assertEqual(before, self.paths.docker_override.read_bytes())
         config = p.read_config(self.paths)
         self.assertEqual(before, self.paths.docker_override.read_bytes())
         self.assertEqual(before_stat.st_ino, self.paths.docker_override.stat().st_ino)

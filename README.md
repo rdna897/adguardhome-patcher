@@ -77,7 +77,7 @@ sudo agh-patcher update
 
 `status` is local and read-only. `check` reads the compatible release and reports frontend and tooling updates separately. `update` verifies the frontend and asks you to type `yes` before replacing files and restarting AdGuard Home; `--yes` explicitly skips the prompt. A tooling-only update does not replace or restart the frontend.
 
-To update management tooling, repeat the release download/verification above and rerun your installer. Docker setup regenerates its override without restarting the container; if `check` reports it is not active, run the Compose command above explicitly. Update AdGuard Home normally, then check for its matching frontend release. Hard-refresh your browser after a frontend update.
+To update management tooling, repeat the release download/verification above and rerun your installer. Docker setup regenerates its override without restarting the container; if `check` reports it is not active, run the Compose command above explicitly. After updating/recreating the AdGuard Home Docker image using the base Compose file only, rerun the compatible released Docker installer and reapply the managed override before updating the frontend. Hard-refresh your browser after a frontend update.
 
 ## Uninstall
 

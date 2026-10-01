@@ -269,10 +269,10 @@ def docker_override(template, config, paths):
     for mount in service["volumes"]:
         # Compose interpolates dollar signs even in JSON-form YAML scalars.
         mount["source"] = sources[mount["target"]].replace("$", "$$")
-    # Compose clears image CMD when overriding ENTRYPOINT.  Keep the image's
-    # arguments only as a fallback; any supplied service command wins unchanged.
-    if config["docker_image_command"]:
-        defaults = shlex.join(config["docker_image_command"])
+    # Compose clears image CMD when overriding ENTRYPOINT.  Keep the base
+    # container's effective arguments as fallback; supplied service commands win.
+    if config["docker_effective_command"]:
+        defaults = shlex.join(config["docker_effective_command"])
         launcher = shlex.join(service["entrypoint"])
         script = f'if [ "$#" -eq 0 ]; then set -- {defaults}; fi; exec {launcher} "$@"'
         service["entrypoint"] = ["/bin/sh", "-c", script.replace("$", "$$"), "agh-patcher"]
@@ -322,9 +322,11 @@ def validate_config(config):
     if config["mode"] == "docker":
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", config.get("compose_service", "")):
             raise Error("Invalid Compose service name")
-        if (not isinstance(config.get("docker_image_command"), list)
-                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_image_command"])):
-            raise Error("Invalid Docker image command")
+        if not isinstance(config.get("docker_image_id"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", config["docker_image_id"]):
+            raise Error("Invalid Docker image identity")
+        if (not isinstance(config.get("docker_effective_command"), list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_effective_command"])):
+            raise Error("Invalid Docker effective command")
         for key in ("docker_override_sha256", "docker_override_revision"):
             if not isinstance(config.get(key), str) or not re.fullmatch(REVISION, config[key]):
                 raise Error("Invalid managed Docker override identity")
@@ -441,6 +443,9 @@ class Patcher:
             safe_directory(override.parent)
             if override.is_symlink() or not override.is_file() or digest(override) != self.config["docker_override_sha256"]:
                 return "Managed Docker override missing or modified; rerun the released Docker installer"
+            image = self.runner.run("docker", "inspect", "--format", "{{.Image}}", self.config["container"]).stdout.strip()
+            if image != self.config["docker_image_id"]:
+                return "Managed Docker override is stale for the current image; rerun the released Docker installer and reapply the override"
             labels = json.loads(self.runner.run("docker", "inspect", "--format", "{{json .Config.Labels}}",
                                                self.config["container"]).stdout) or {}
             if not isinstance(labels, dict) or labels.get(DOCKER_OVERRIDE_LABEL) != self.config["docker_override_revision"]:
@@ -866,13 +871,20 @@ def setup(mode, repository, container, source, paths=None, runner=None, environ=
         image = runner.run("docker", "inspect", "--format", "{{.Image}}", config["container"]).stdout.strip()
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
             raise Error("Invalid Docker image identity")
-        config["docker_image_command"] = json.loads(runner.run(
-            "docker", "image", "inspect", "--format", "{{json .Config.Cmd}}", image).stdout)
-        if config["docker_image_command"] is None:
-            config["docker_image_command"] = []
-        if (not isinstance(config["docker_image_command"], list)
-                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_image_command"])):
-            raise Error("Invalid Docker image command")
+        config["docker_image_id"] = image
+        command = json.loads(runner.run(
+            "docker", "inspect", "--format", "{{json .Config.Cmd}}", config["container"]).stdout)
+        if labels.get(DOCKER_OVERRIDE_LABEL):
+            if image != old.get("docker_image_id"):
+                raise Error("Recreate the Docker container with its base Compose file only before rerunning the released Docker installer")
+            # The active entrypoint may have absorbed CMD.  A tooling-only
+            # reinstall retains the captured base command for the same image.
+            if command is None or command == []:
+                command = old["docker_effective_command"]
+        config["docker_effective_command"] = [] if command is None else command
+        if (not isinstance(config["docker_effective_command"], list)
+                or any(not isinstance(arg, str) or "\0" in arg for arg in config["docker_effective_command"])):
+            raise Error("Invalid Docker effective command")
         override_bytes, override_revision = docker_override((source / "install/docker/compose.override.yaml").read_text(), config, paths)
         config["docker_override_sha256"] = hashlib.sha256(override_bytes).hexdigest()
         config["docker_override_revision"] = override_revision
