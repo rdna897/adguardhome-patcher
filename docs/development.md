@@ -26,6 +26,8 @@ The frontend input fingerprint (`frontend-input:`) hashes the exact `FRONTEND_IN
 
 The tooling revision (`tooling:`) hashes `TOOLING_INPUTS`: installation files plus release/build orchestration. It is stored in `TOOLS.json`, the frontend manifest and the local configuration. The bundle manifest stores installation-file hashes independently, allowing the installer to verify released files without packaging CI or frontend source. The external bundle checksum protects the complete downloaded archive. README, documentation and tests do not affect either input fingerprint. Tooling updates never select a frontend replacement or restart.
 
+`TOOLS.json` also records the build's source commit for immutable [recovery documentation](safety-and-recovery.md#interrupted-updates) links. Publication requires it to match the workflow commit. Docker setup generates its managed override from the released JSON-form YAML template and host configuration, records its exact hash, and adds a configuration fingerprint label. Tooling availability checks require the managed file and running container label to match, so a stale override cannot appear current. Reinstallation writes the override before committing the new configuration/revision and never invokes Compose or restarts the container.
+
 ## GitHub Actions
 
 PR validation checks out the exact PR head with `contents: read` and no persisted credentials. It runs the browser-inclusive gate without publishing or modifying issues.

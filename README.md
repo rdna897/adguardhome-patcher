@@ -55,22 +55,17 @@ The binary defaults to `/opt/AdGuardHome`. For a custom directory, run the insta
 
 ### Docker
 
-Run on the host; replace `adguardhome` with your container name:
+Run the installer on the host, then apply its managed override from your Compose directory:
 
 ```sh
 sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
-```
-
-From your existing Compose directory, copy the supplied override and recreate the service with both files:
-
-```sh
-cp /opt/adguardhome-patcher/install/docker/compose.override.yaml compose.patcher.yaml
-sudo docker compose -f compose.yaml -f compose.patcher.yaml up -d adguardhome
+sudo docker compose -f compose.yaml \
+  -f /opt/adguardhome-patcher/compose.patcher.yaml up -d adguardhome
 agh-patcher check
 sudo agh-patcher update
 ```
 
-Use your actual Compose filename and service name; adjust the override's service key if needed. Keep your existing work/config volumes, ports, networking and additional command flags. The override mounts the parent UI directory and launcher read-only. Keep your customized `compose.patcher.yaml` for subsequent Compose operations.
+The installer takes `<container-name> [compose-service-name]`; the service defaults to the container's Compose label, then its container name. For different names, use e.g. `install.sh agh-container dns` and `up -d dns`. Use your actual base Compose filename. The patcher owns the override; your base file and data volumes remain administrator-owned. Keep using both files for Docker operations and preserve your ports, networking and additional command flags in the base file.
 
 ## Update
 
@@ -82,7 +77,7 @@ sudo agh-patcher update
 
 `status` is local and read-only. `check` reads the compatible release and reports frontend and tooling updates separately. `update` verifies the frontend and asks you to type `yes` before replacing files and restarting AdGuard Home; `--yes` explicitly skips the prompt. A tooling-only update does not replace or restart the frontend.
 
-To update management tooling, repeat the release download/verification above and rerun your installer. Update AdGuard Home normally, then check for its matching frontend release. Docker operations must retain both Compose files. Hard-refresh your browser after a frontend update.
+To update management tooling, repeat the release download/verification above and rerun your installer. Docker setup regenerates its override without restarting the container; if `check` reports it is not active, run the Compose command above explicitly. Update AdGuard Home normally, then check for its matching frontend release. Hard-refresh your browser after a frontend update.
 
 ## Uninstall
 
@@ -103,6 +98,6 @@ Confirm with `yes`. Uninstall restores stock UI and removes managed tooling/fron
 
 ## How it works
 
-The patch changes only the frontend. Releases match the exact AdGuard Home version; downloads are checked against SHA-256 checksums and manifests. Frontend identity comes from the actual built files, independently of the tooling revision. Confirmed updates retain a rollback copy and durable transaction journal. No automatic updater is installed. [Safety and recovery details](docs/manual-updates.md).
+The patch changes only the frontend. Releases match the exact AdGuard Home version; downloads are checked against SHA-256 checksums and manifests. Frontend identity comes from the actual built files, independently of the tooling revision. Confirmed updates retain a rollback copy and durable transaction journal. No automatic updater is installed. [Safety and recovery details](docs/safety-and-recovery.md).
 
 [Development and release validation](docs/development.md) · [GPL-3.0](LICENSE). This is not an official AdGuard product.

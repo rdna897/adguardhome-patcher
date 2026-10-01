@@ -186,7 +186,8 @@ jobs:
           fi
           tools_manifest=$(tar -xzOf dist/agh-patcher-tools.tar.gz TOOLS.json)
           if [ "$(jq -r .tooling_revision <<<"$tools_manifest")" != "$TOOLING_SHA" ] || \
-             [ "$(jq -r .adguard_version <<<"$tools_manifest")" != "$RELEASE_TAG" ]; then
+             [ "$(jq -r .adguard_version <<<"$tools_manifest")" != "$RELEASE_TAG" ] || \
+             [ "$(jq -r .source_commit <<<"$tools_manifest")" != "$BUILD_COMMIT" ]; then
             echo '::error::Released installer tooling does not match the release identity/version'
             exit 1
           fi

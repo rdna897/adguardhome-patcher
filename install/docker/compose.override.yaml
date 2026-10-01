@@ -1,27 +1,42 @@
-# Merge with the existing Compose file. Match this service key to your AdGuard service.
-services:
-  adguardhome:
-    working_dir: /opt/adguardhome/ui
-    entrypoint: ["/bin/sh", "/opt/adguardhome-patcher/agh-launch.sh"]
-    command:
-      - --no-check-update
-      - -c
-      - /opt/adguardhome/conf/AdGuardHome.yaml
-      - -w
-      - /opt/adguardhome/work
-    environment:
-      AGH_BIN: /opt/adguardhome/AdGuardHome
-      AGH_UI_ROOT: /opt/adguardhome/ui
-    volumes:
-      - type: bind
-        source: /usr/local/lib/adguardhome-patcher/agh-launch.sh
-        target: /opt/adguardhome-patcher/agh-launch.sh
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${AGH_UI_ROOT:-/opt/adguardhome-patcher/ui}
-        target: /opt/adguardhome/ui
-        read_only: true
-        bind:
-          create_host_path: false
+{
+  "services": {
+    "adguardhome": {
+      "command": [
+        "--no-check-update",
+        "-c",
+        "/opt/adguardhome/conf/AdGuardHome.yaml",
+        "-w",
+        "/opt/adguardhome/work"
+      ],
+      "entrypoint": [
+        "/bin/sh",
+        "/opt/adguardhome-patcher/agh-launch.sh"
+      ],
+      "environment": {
+        "AGH_BIN": "/opt/adguardhome/AdGuardHome",
+        "AGH_UI_ROOT": "/opt/adguardhome/ui"
+      },
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/usr/local/lib/adguardhome-patcher/agh-launch.sh",
+          "target": "/opt/adguardhome-patcher/agh-launch.sh",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/opt/adguardhome-patcher/ui",
+          "target": "/opt/adguardhome/ui",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/opt/adguardhome/ui"
+    }
+  }
+}

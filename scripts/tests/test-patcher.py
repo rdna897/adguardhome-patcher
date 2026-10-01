@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location("identity", SOURCE / "scripts/rele
 identity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(identity)
 VERSION = "v0.107.79"
+SOURCE_COMMIT = subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip()
 
 
 def static_files(label):
@@ -95,6 +96,7 @@ class FakeRunner:
         self.running = True
         self.unhealthy_restarts = 0
         self.mounts = []
+        self.labels = {}
         self.version = VERSION
 
     def run(self, *args, check=True):
@@ -116,7 +118,9 @@ class FakeRunner:
         elif args[:2] == ("systemctl", "is-active"):
             code = 0 if self.running else 1
         elif args[:2] == ("docker", "inspect"):
-            stdout = json.dumps(self.mounts) if args[3] == "{{json .Mounts}}" else json.dumps({"Running": self.running})
+            values = {"{{json .Mounts}}": self.mounts, "{{json .Config.Labels}}": self.labels,
+                      "{{json .State}}": {"Running": self.running}}
+            stdout = json.dumps(values[args[3]])
         result = SimpleNamespace(returncode=code, stdout=stdout, stderr="fixture failure" if code else "")
         if check and code:
             raise p.Error("restart failed")
@@ -130,7 +134,7 @@ class ManualPatcher(unittest.TestCase):
         self.root = Path(temp.name)
         self.paths = p.Paths(self.root)
         self.source = self.root / "tools"
-        identity.package_tools(SOURCE, self.root / "tools-dist", VERSION)
+        identity.package_tools(SOURCE, self.root / "tools-dist", VERSION, SOURCE_COMMIT)
         with tarfile.open(self.root / "tools-dist" / identity.TOOLS_ASSET) as bundle:
             for member in bundle:
                 target = self.source / member.name
@@ -142,7 +146,7 @@ class ManualPatcher(unittest.TestCase):
         (self.agh / "AdGuardHome.yaml").write_bytes(b"configuration must remain intact")
         (self.agh / "work/data.db").write_bytes(b"server query log/statistics")
         self.config = {"schema": 1, "mode": "native", "repository": "rdna897/adguardhome-patcher",
-                       "agh_dir": str(self.agh), "ui_root": str(self.agh), "tooling_revision": "1" * 64}
+                       "agh_dir": str(self.agh), "ui_root": str(self.agh), "tooling_revision": "1" * 64, "source_commit": SOURCE_COMMIT}
         self.runner = FakeRunner(self.paths, self.agh)
         self.network = FakeNetwork()
         self.tool = p.Patcher(self.config, self.paths, self.runner, self.network, confirm=lambda _: False)
@@ -498,9 +502,259 @@ class ManualPatcher(unittest.TestCase):
         tool.uninstall(yes=True)
         self.assertFalse(self.paths.command.exists())
         self.assertFalse(self.paths.docker_launcher.exists())
+        self.assertFalse(self.paths.docker_override.exists())
+
+    def setup_docker(self, container="adguardhome", service=None, ui=None):
+        p.setup("docker", None, container, self.source, self.paths, self.runner,
+                {"AGH_UI_ROOT": str(ui or self.root / "ui")}, compose_service=service)
+        return p.Patcher(p.read_config(self.paths), self.paths, self.runner, self.network)
+
+    def apply_docker_override(self):
+        config = p.read_config(self.paths)
+        self.runner.labels = {"com.docker.compose.service": config["compose_service"],
+                              p.DOCKER_OVERRIDE_LABEL: config["docker_override_revision"]}
+        self.runner.mounts = [{"Destination": "/opt/adguardhome/ui", "Source": config["ui_root"]},
+                              {"Destination": "/opt/adguardhome-patcher/agh-launch.sh", "Source": str(self.paths.docker_launcher)}]
+
+    def update_released_tools(self, change_template=True):
+        root = self.identity_tree()
+        if change_template:
+            template_path = root / "install/docker/compose.override.yaml"
+            template = json.loads(template_path.read_text())
+            template["services"]["adguardhome"]["environment"]["RELEASE_TEST_SETTING"] = "changed"
+            template_path.write_text(json.dumps(template))
+        else:
+            manager = root / "scripts/agh-patcher.py"
+            manager.write_text(manager.read_text() + "\n# tooling-only release fixture\n")
+        out = self.root / "updated-tools"
+        result = identity.package_tools(root, out, VERSION, SOURCE_COMMIT)
+        with tarfile.open(out / identity.TOOLS_ASSET) as bundle:
+            for member in bundle:
+                target = self.source / member.name
+                target.write_bytes(bundle.extractfile(member).read())
+        return result
+
+    def test_docker_installer_generates_deterministic_managed_yaml_and_expected_mounts(self):
+        tool = self.setup_docker()
+        config = p.read_config(self.paths)
+        data = self.paths.docker_override.read_bytes()
+        generated = json.loads(data)
+        self.assertEqual(set(generated["services"]), {"adguardhome"})
+        service = generated["services"]["adguardhome"]
+        self.assertEqual(service["working_dir"], "/opt/adguardhome/ui")
+        self.assertEqual(service["entrypoint"], ["/bin/sh", "/opt/adguardhome-patcher/agh-launch.sh"])
+        self.assertEqual(service["environment"]["AGH_BIN"], "/opt/adguardhome/AdGuardHome")
+        self.assertEqual(service["labels"][p.DOCKER_OVERRIDE_LABEL], config["docker_override_revision"])
+        mounts = {mount["target"]: mount for mount in service["volumes"]}
+        self.assertEqual(mounts["/opt/adguardhome/ui"]["source"], config["ui_root"])
+        self.assertEqual(mounts["/opt/adguardhome-patcher/agh-launch.sh"]["source"], str(self.paths.docker_launcher))
+        self.assertTrue(all(mount["read_only"] and not mount["bind"]["create_host_path"] for mount in mounts.values()))
+        self.assertEqual(hashlib.sha256(data).hexdigest(), config["docker_override_sha256"])
+        rerendered, revision = p.docker_override((self.source / "install/docker/compose.override.yaml").read_text(), config, self.paths)
+        self.assertEqual(rerendered, data)
+        self.assertEqual(revision, config["docker_override_revision"])
+        self.assertEqual(self.paths.docker_override.stat().st_mode & 0o777, 0o644)
+        self.assertIn(str(self.paths.docker_override), tool.compose_action())
+        self.assert_no_restart()
+
+    def test_docker_container_and_compose_service_names_are_distinct_and_preserved(self):
+        self.runner.labels = {"com.docker.compose.service": "dns"}
+        self.setup_docker("agh-container", "dns", self.root / "custom-ui")
+        config = p.read_config(self.paths)
+        self.assertEqual(config["container"], "agh-container")
+        self.assertEqual(config["compose_service"], "dns")
+        self.assertEqual(set(json.loads(self.paths.docker_override.read_text())["services"]), {"dns"})
+        before = self.snapshot()
+        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_restart()
+
+    def test_docker_service_defaults_to_compose_label(self):
+        self.runner.labels = {"com.docker.compose.service": "dns-resolver"}
+        self.setup_docker("agh-container")
+        self.assertEqual(p.read_config(self.paths)["compose_service"], "dns-resolver")
+
+    def test_docker_service_can_be_explicit_without_a_compose_label(self):
+        self.setup_docker("agh-container", "dns")
+        self.assertEqual(p.read_config(self.paths)["compose_service"], "dns")
+
+    def test_docker_installer_cli_routes_container_and_service_arguments(self):
+        with patch.object(p.sys, "argv", ["agh-patcher", "install-docker", "agh-container", "dns"]), \
+             patch.object(p.os, "geteuid", return_value=0), patch.object(p, "setup") as setup:
+            p.main()
+        args, kwargs = setup.call_args
+        self.assertEqual(args[:3], ("docker", None, "agh-container"))
+        self.assertEqual(kwargs["compose_service"], "dns")
+
+    def test_docker_bad_names_and_mismatched_service_are_rejected_before_writes(self):
+        for container, service, labels in (("--unsafe", "dns", {}), ("agh", "dns\nother", {}),
+                                           ("agh", "wrong", {"com.docker.compose.service": "dns"})):
+            self.runner.labels = labels
+            before = self.snapshot()
+            with self.assertRaises(p.Error):
+                self.setup_docker(container, service)
+            self.assertEqual(self.snapshot(), before)
+        self.assert_no_restart()
+
+    def test_docker_override_escapes_paths_without_compose_interpolation(self):
+        self.setup_docker("agh", "dns", self.root / 'ui $HOME "quoted"')
+        service = json.loads(self.paths.docker_override.read_text())["services"]["dns"]
+        mount = next(mount for mount in service["volumes"] if mount["target"] == "/opt/adguardhome/ui")
+        self.assertEqual(mount["source"], str(self.root / 'ui $$HOME "quoted"'))
+
+    def test_docker_tooling_reinstall_updates_override_and_requires_explicit_activation(self):
+        base = self.root / "compose.yaml"
+        base.write_text("services:\n  dns:\n    image: adguard/adguardhome\n")
+        self.runner.labels = {"com.docker.compose.service": "dns"}
+        self.setup_docker("agh-container", "dns", self.root / "custom-ui")
+        self.apply_docker_override()
+        old = p.read_config(self.paths)
+        old_override = self.paths.docker_override.read_bytes()
+        before_base = base.read_bytes()
+        released = self.update_released_tools()
+        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        config = p.read_config(self.paths)
+        tool = p.Patcher(config, self.paths, self.runner, self.network)
+        self.network.tooling = released["tooling_revision"]
+        self.assertNotEqual(config["tooling_revision"], old["tooling_revision"])
+        self.assertEqual(config["tooling_revision"], released["tooling_revision"])
+        self.assertNotEqual(old_override, self.paths.docker_override.read_bytes())
+        self.assertEqual(config["container"], old["container"])
+        self.assertEqual(config["compose_service"], old["compose_service"])
+        self.assertEqual(config["ui_root"], old["ui_root"])
+        before = self.snapshot()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            tool.status(remote=True)
+        self.assertIn("Managed Docker override not active", output.getvalue())
+        self.assertNotIn("tooling up to date", output.getvalue())
+        self.assertEqual(self.snapshot(), before)
+        self.apply_docker_override()
+        with contextlib.redirect_stdout(output := io.StringIO()):
+            tool.status(remote=True)
+        self.assertIn("tooling up to date", output.getvalue())
+        self.assertEqual(base.read_bytes(), before_base)
+        self.assert_no_restart()
+        self.assertFalse(any(command[:2] == ("docker", "compose") for command in self.runner.calls))
+
+    def test_docker_manager_only_reinstall_preserves_active_override_without_restart(self):
+        self.setup_docker()
+        self.apply_docker_override()
+        before = self.paths.docker_override.read_bytes()
+        released = self.update_released_tools(change_template=False)
+        p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        config = p.read_config(self.paths)
+        self.assertEqual(before, self.paths.docker_override.read_bytes())
+        self.network.tooling = released["tooling_revision"]
+        tool = p.Patcher(config, self.paths, self.runner, self.network)
+        self.assertEqual(tool.tooling_comparison(self.network.tooling), ("tooling up to date", None))
+        self.assert_no_restart()
+
+    def test_docker_modified_or_missing_override_never_reports_current_tooling(self):
+        tool = self.setup_docker()
+        self.apply_docker_override()
+        self.network.tooling = tool.config["tooling_revision"]
+        original = self.paths.docker_override.read_bytes()
+        for contents in (b"administrator content", None):
+            if contents is None:
+                self.paths.docker_override.unlink()
+            else:
+                self.paths.docker_override.write_bytes(contents)
+            before = self.snapshot()
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                tool.status(remote=True)
+                tool.status()
+            self.assertIn("Managed Docker override missing or modified", output.getvalue())
+            self.assertNotIn("tooling up to date", output.getvalue())
+            self.assertEqual(before, self.snapshot())
+        self.paths.docker_override.write_bytes(original)
+        self.assert_no_restart()
+
+    def test_docker_setup_refuses_unowned_modified_or_symlinked_override(self):
+        self.paths.docker_override.parent.mkdir(parents=True)
+        self.paths.docker_override.write_text("administrator content")
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "modified or unowned"):
+            self.setup_docker()
+        self.assertEqual(before, self.snapshot())
+        self.paths.docker_override.unlink()
+        self.setup_docker()
+        self.paths.docker_override.write_text("administrator content")
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "modified or unowned"):
+            p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        self.assertEqual(before, self.snapshot())
+        target = self.root / "outside.yaml"
+        self.paths.docker_override.rename(target)
+        self.paths.docker_override.symlink_to(target)
+        with self.assertRaisesRegex(p.Error, "symlinked managed"):
+            p.setup("docker", None, None, self.source, self.paths, self.runner, {})
+        self.assertEqual(target.read_text(), "administrator content")
+
+    def test_docker_uninstall_preserves_base_compose_and_server_data(self):
+        tool = self.setup_docker()
+        base = self.root / "compose.yaml"
+        base.write_text("administrator base Compose file")
+        data = {name: (self.agh / name).read_bytes() for name in ("AdGuardHome.yaml", "work/data.db")}
+        self.apply_docker_override()
+        tool.update(yes=True)
+        before = self.snapshot()
+        for destination in ("/opt/adguardhome/ui", "/opt/adguardhome-patcher/agh-launch.sh"):
+            self.runner.mounts = [{"Destination": destination}]
+            with self.assertRaisesRegex(p.Error, "base Compose file only"):
+                tool.uninstall(yes=True)
+            self.assertEqual(before, self.snapshot())
+        self.runner.mounts = []
+        tool.uninstall(yes=True)
+        for path in (self.paths.docker_override, self.paths.command, self.paths.docker_launcher,
+                     self.paths.config, self.paths.state, tool.build):
+            self.assertFalse(path.exists())
+        self.assertEqual(base.read_text(), "administrator base Compose file")
+        for name, contents in data.items():
+            self.assertEqual((self.agh / name).read_bytes(), contents)
+
+    def test_docker_uninstall_retains_modified_override_and_refuses_symlinks(self):
+        tool = self.setup_docker()
+        self.paths.docker_override.write_text("administrator content")
+        target = self.root / "outside.yaml"
+        self.paths.docker_override.rename(target)
+        self.paths.docker_override.symlink_to(target)
+        before = self.snapshot()
+        with self.assertRaisesRegex(p.Error, "unsafe managed"):
+            tool.uninstall(yes=True)
+        self.assertEqual(before, self.snapshot())
+        self.paths.docker_override.unlink()
+        target.rename(self.paths.docker_override)
+        tool.uninstall(yes=True)
+        self.assertEqual(self.paths.docker_override.read_text(), "administrator content")
+
+    def test_recovery_error_links_to_installed_release_source_commit(self):
+        p.atomic_json(self.paths.state / "transaction.json", {"backup": "retained"})
+        before = self.snapshot()
+        expected = f"https://github.com/rdna897/adguardhome-patcher/blob/{SOURCE_COMMIT}/docs/safety-and-recovery.md#interrupted-updates"
+        with self.assertRaisesRegex(p.Error, "interrupted update") as error:
+            self.tool.update(yes=True)
+        self.assertIn("Recovery instructions".lower(), str(error.exception).lower())
+        self.assertIn(expected, str(error.exception))
+        self.assertNotIn("see docs/", str(error.exception))
+        with contextlib.redirect_stdout(output := io.StringIO()):
+            self.tool.status()
+        self.assertIn(expected, output.getvalue())
+        self.assertEqual(before, self.snapshot())
+
+    def test_tools_manifest_records_and_validates_immutable_recovery_source(self):
+        manifest = self.source / identity.TOOLS_MANIFEST
+        data = json.loads(manifest.read_text())
+        self.assertEqual(data["source_commit"], SOURCE_COMMIT)
+        data["source_commit"] = "main"
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "Invalid tools manifest"):
+            identity.verify_tools(self.source)
 
     def test_docker_update_checks_container_and_keeps_parent_mount_layout(self):
-        self.config.update(mode="docker", container="adguardhome", ui_root=str(self.root / "ui"))
+        self.setup_docker()
+        self.apply_docker_override()
+        self.config = p.read_config(self.paths)
         tool = p.Patcher(self.config, self.paths, self.runner, self.network)
         self.runner.mounts = [{"Destination": "/opt/adguardhome/ui", "Source": str(self.root / "ui")}]
         tool.update(yes=True)
@@ -511,7 +765,7 @@ class ManualPatcher(unittest.TestCase):
     def identity_tree(self):
         root = self.root / "identity"
         for name in (*identity.FRONTEND_INPUTS, *identity.TOOLING_INPUTS,
-                     "README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py"):
+                     "README.md", "docs/safety-and-recovery.md", "scripts/tests/test-patcher.py"):
             target = root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(SOURCE / name, target)
@@ -579,7 +833,7 @@ class ManualPatcher(unittest.TestCase):
         root = self.identity_tree()
         build = self.static_tree("manifest-build", self.BUILT).parent
         first = identity.manifest(root, build, VERSION)
-        for name in ("README.md", "docs/manual-updates.md", "scripts/tests/test-patcher.py",
+        for name in ("README.md", "docs/safety-and-recovery.md", "scripts/tests/test-patcher.py",
                      "scripts/agh-patcher.py", "install/native/install.sh"):
             file = root / name
             file.write_text(file.read_text() + "\n# documentation/test/tooling change\n")
@@ -650,11 +904,11 @@ class ManualPatcher(unittest.TestCase):
     def complete_release(self):
         root = self.identity_tree()
         out, _ = self.release_dir(root)
-        identity.package_tools(root, out, VERSION)
+        identity.package_tools(root, out, VERSION, SOURCE_COMMIT)
         source = "agh-dashboard-range-source.tar.gz"
         with tarfile.open(out / source, "w:gz") as bundle:
             for name in sorted(set((*identity.FRONTEND_INPUTS, *identity.TOOLING_INPUTS,
-                                    "scripts/tests/test-patcher.py", "docs/manual-updates.md"))):
+                                    "scripts/tests/test-patcher.py", "docs/safety-and-recovery.md"))):
                 bundle.add(root / name, "./patcher/" + name)
         for name in (p.ASSET, source):
             (out / (name + ".sha256")).write_text(hashlib.sha256((out / name).read_bytes()).hexdigest() + "  " + name + "\n")
@@ -692,7 +946,7 @@ class ManualPatcher(unittest.TestCase):
         manager.write_text(manager.read_text() + "\n# updated build source\n")
         with self.assertRaisesRegex(ValueError, "revision differs"):
             identity.verify_tools_archive(root, out, VERSION)
-        identity.package_tools(root, out, VERSION)
+        identity.package_tools(root, out, VERSION, SOURCE_COMMIT)
         identity.verify_tools_archive(root, out, VERSION)
 
     def test_tools_bundle_version_and_manifest_revision_are_validated(self):

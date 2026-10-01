@@ -1,4 +1,4 @@
-# Manual patch management
+# Safety and recovery
 
 ## Installation and commands
 
@@ -9,6 +9,14 @@ Install the checksum-verified `agh-patcher-tools.tar.gz` from the `ui-<AdGuard H
 `sudo agh-patcher uninstall` removes the CLI, launcher, patcher configuration/state, managed frontend and recorded rollback material. Native uninstall removes its service override and verifies the stock service before deleting frontend files. Docker must first be recreated without patcher mounts; uninstall refuses while those mounts remain. AdGuard Home's binary, YAML, work/config/query data and unrelated service overrides are preserved. Unrecognized frontend directories are retained. The downloaded tools directory is left for the administrator to remove.
 
 No host timer or scheduled checker is installed. GitHub's scheduled builds publish release assets only.
+
+## Managed Docker override
+
+The Docker installer writes only `/opt/adguardhome-patcher/compose.patcher.yaml`, using the verified release template, configured Compose service and UI/launcher paths. The JSON-form YAML is deterministic and needs no host YAML library. The container argument identifies the running container; the optional second argument identifies its Compose service. The service defaults to its Compose label, then its container name, and an explicit name must agree with an existing Compose service label.
+
+Setup records the generated file's SHA-256 and a configuration fingerprint carried by the container as a label. `status` and `check` verify the file; `check` reports tooling current only when its release revision, managed file and running container fingerprint align. Template/configuration changes require an explicit Compose recreation. Updating only the manager can retain the same override fingerprint without recreating the container. Tooling installation never restarts the container.
+
+The base Compose file is not edited. Do not edit the managed override; preserve additional administrator flags/settings in the base file. If the managed file is modified or an unowned file occupies its path, preserve/move that file before reinstalling. Uninstall refuses while patcher mounts remain and removes an unchanged managed override; a modified regular file is retained instead of deleting possible administrator content.
 
 ## Integrity and compatibility
 
@@ -31,6 +39,8 @@ A failed swap, restart, validation or commit records `rolling_back`, restores th
 ## Interrupted updates
 
 Power loss or SIGKILL can interrupt the renames or restart. `/var/lib/agh-patcher/transaction.json` records the exact build/stage/backup paths and last committed phase. `status` reports the interruption, and further updates refuse to proceed. Recovery requires administrator action.
+
+CLI recovery messages link to these instructions at the immutable source commit recorded in the installed release's `TOOLS.json`. The tools bundle does not need a local documentation directory.
 
 Stop AdGuard Home and inspect both the recorded paths and journal phase; the phase can lag a completed rename. For `prepared`, `backup_saved`, `installed` or `rolling_back`, restore the retained working backup where needed, or remove a partial first-install build to use stock UI. For `committed`, the build and receipt were flushed after validation: inspect them before deciding whether to keep or restore the build. For `rolled_back`, verify the restored build/service. Restart and verify the service, retain recovery material until confirmed, then remove the journal and flush its parent directory, for example with `sync` after explicit removal. A stage left before journal creation cannot have changed the live frontend.
 

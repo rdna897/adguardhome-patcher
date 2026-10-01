@@ -14,6 +14,7 @@ import io
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -41,6 +42,8 @@ def verify_tools(root, version=None):
     if (not isinstance(result, dict) or result.get("schema") != 1
             or not isinstance(result.get("tooling_revision"), str)
             or not re.fullmatch(r"[a-f0-9]{64}", result["tooling_revision"])
+            or not isinstance(result.get("source_commit"), str)
+            or not re.fullmatch(r"[a-f0-9]{40}", result["source_commit"])
             or not isinstance(result.get("adguard_version"), str)
             or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?", result["adguard_version"])):
         raise ValueError("Invalid tools manifest")
@@ -55,10 +58,13 @@ def verify_tools(root, version=None):
     return result
 
 
-def package_tools(root, out, version):
+def package_tools(root, out, version, source_commit):
     """Package only installation files and their release identity/integrity metadata."""
     out.mkdir(parents=True, exist_ok=True)
+    if not re.fullmatch(r"[a-f0-9]{40}", source_commit):
+        raise ValueError("Invalid tools source commit")
     result = {"schema": 1, "adguard_version": version, "tooling_revision": tooling_revision(root),
+              "source_commit": source_commit,
               "files": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in TOOLS_FILES}}
     data = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
     asset = out / TOOLS_ASSET
@@ -165,7 +171,7 @@ def verify_release(root, out, version):
         raise ValueError("Frontend and tools release identities differ")
     with tarfile.open(out / "agh-dashboard-range-source.tar.gz", "r:gz") as bundle:
         for name in sorted(set((*FRONTEND_INPUTS, *TOOLING_INPUTS,
-                                "scripts/tests/test-patcher.py", "docs/manual-updates.md"))):
+                                "scripts/tests/test-patcher.py", "docs/safety-and-recovery.md"))):
             if bundle.extractfile("./patcher/" + name).read() != (root / name).read_bytes():
                 raise ValueError("Source release tooling differs: " + name)
         if any(member.name.startswith("./patcher/") and
@@ -190,7 +196,8 @@ if __name__ == "__main__":
     elif arguments == ["--tooling"]:
         print(tooling_revision(root))
     elif len(arguments) == 3 and arguments[0] == "--tools":
-        print(package_tools(root, Path(arguments[2]), arguments[1])["tooling_revision"])
+        source_commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+        print(package_tools(root, Path(arguments[2]), arguments[1], source_commit)["tooling_revision"])
     elif len(arguments) == 3 and arguments[0] == "--artifact":
         print(archive_revision(root, Path(arguments[2]), arguments[1])["patch_revision"])
     elif len(arguments) == 3 and arguments[0] == "--verify":
