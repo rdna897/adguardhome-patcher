@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -128,6 +129,181 @@ class FakeRunner:
         if check and code:
             raise p.Error("restart failed")
         return result
+
+
+class BootstrapInstaller(unittest.TestCase):
+    """Execute the host bootstrap with isolated filesystem/network command stubs."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.tmp = self.root / "tmp"
+        self.tmp.mkdir()
+        self.log = self.root / "calls.jsonl"
+        stub = self.bin / "stub"
+        stub.write_text(f"#!{sys.executable}\n" + '''import hashlib,json,os,pathlib,subprocess,sys
+name=pathlib.Path(sys.argv[0]).name
+args=sys.argv[1:]
+with open(os.environ["BOOTSTRAP_LOG"],"a") as out:
+    out.write(json.dumps({"name":name,"args":args,"agh_dir":os.environ.get("AGH_DIR"),"cwd":os.getcwd()})+"\\n")
+if name=="id":
+    print(os.environ.get("BOOTSTRAP_UID","0"))
+elif name in ("AdGuardHome","docker"):
+    if os.environ.get("BOOTSTRAP_VERSION_FAIL"):
+        sys.exit(1)
+    print(os.environ.get("BOOTSTRAP_VERSION","AdGuard Home, version v9.8.7"))
+elif name=="curl":
+    if os.environ.get("BOOTSTRAP_DOWNLOAD_FAIL"):
+        sys.exit(22)
+    target=pathlib.Path(args[args.index("-o")+1])
+    payload=b"released tools fixture"
+    if target.name.endswith(".sha256"):
+        checksum="0"*64 if os.environ.get("BOOTSTRAP_BAD_CHECKSUM") else hashlib.sha256(payload).hexdigest()
+        filename="other.tar.gz" if os.environ.get("BOOTSTRAP_OTHER_CHECKSUM") else "agh-patcher-tools.tar.gz"
+        target.write_text(checksum+"  "+filename+"\\n")
+    else:
+        target.write_bytes(payload)
+elif name=="sha256sum":
+    sys.exit(subprocess.call([os.environ["BOOTSTRAP_REAL_SHA256SUM"],*args]))
+elif name=="sh":
+    sys.exit(int(os.environ.get("BOOTSTRAP_INSTALL_EXIT","0")))
+elif name=="tar":
+    sys.exit(int(os.environ.get("BOOTSTRAP_TAR_EXIT","0")))
+elif name!="install":
+    raise RuntimeError("Unexpected fixture command: "+name)
+''')
+        stub.chmod(0o755)
+        for command in ("id", "curl", "tar", "sha256sum", "install", "docker", "sh"):
+            (self.bin / command).symlink_to(stub)
+        self.agh = self.root / "custom AdGuardHome"
+        self.agh.mkdir()
+        (self.agh / "AdGuardHome").symlink_to(stub)
+        self.env = {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
+                    "AGH_DIR": str(self.agh), "TMPDIR": str(self.tmp), "BOOTSTRAP_LOG": str(self.log),
+                    "BOOTSTRAP_REAL_SHA256SUM": shutil.which("sha256sum")}
+
+    def run_bootstrap(self, *args, **environment):
+        result = subprocess.run(["/bin/sh", str(SOURCE / "install.sh"), *args],
+                                env={**self.env, **environment}, capture_output=True, text=True)
+        self.calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        self.assertEqual(list(self.tmp.iterdir()), [], "Private download directory must be cleaned up")
+        self.assertFalse(any(call["name"] == "docker" and call["args"][0] != "exec" for call in self.calls))
+        return result
+
+    def assert_no_install(self):
+        self.assertFalse(any(call["name"] in ("install", "tar", "sh") for call in self.calls))
+
+    def test_native_version_url_checksum_and_released_handoff(self):
+        result = self.run_bootstrap("native")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(next(call for call in self.calls if call["name"] == "AdGuardHome")["args"], ["--version"])
+        downloads = [call for call in self.calls if call["name"] == "curl"]
+        base = "https://github.com/rdna897/adguardhome-patcher/releases/download/ui-v9.8.7/"
+        for call, name in zip(downloads, (identity.TOOLS_ASSET, identity.TOOLS_ASSET + ".sha256")):
+            self.assertEqual(call["args"], ["--proto", "=https", "--proto-redir", "=https",
+                                            "-fL", "--retry", "2", base + name, "-o", name])
+        self.assertEqual(len(downloads), 2)
+        operations = [call["name"] for call in self.calls]
+        self.assertLess(operations.index("sha256sum"), operations.index("tar"))
+        self.assertEqual(next(call for call in self.calls if call["name"] == "install")["args"],
+                         ["-d", "-m", "755", "/opt/adguardhome-patcher"])
+        self.assertEqual(next(call for call in self.calls if call["name"] == "tar")["args"],
+                         ["--no-same-owner", "--no-same-permissions", "-xzf", identity.TOOLS_ASSET,
+                          "-C", "/opt/adguardhome-patcher"])
+        handoff = self.calls[-1]
+        self.assertEqual(handoff["name"], "sh")
+        self.assertEqual(handoff["args"], ["/opt/adguardhome-patcher/install/native/install.sh"])
+        self.assertEqual(handoff["agh_dir"], str(self.agh))
+
+    def test_docker_version_and_container_service_handoff(self):
+        result = self.run_bootstrap("docker", "agh-container", "dns")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(next(call for call in self.calls if call["name"] == "docker")["args"],
+                         ["exec", "agh-container", "/opt/adguardhome/AdGuardHome", "--version"])
+        self.assertEqual(self.calls[-1]["args"],
+                         ["/opt/adguardhome-patcher/install/docker/install.sh", "agh-container", "dns"])
+
+    def test_docker_optional_service_is_not_invented(self):
+        result = self.run_bootstrap("docker", "adguardhome")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls[-1]["args"], ["/opt/adguardhome-patcher/install/docker/install.sh", "adguardhome"])
+
+    def test_checksum_failure_stops_before_extraction(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_BAD_CHECKSUM="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_no_install()
+
+    def test_checksum_for_another_archive_is_rejected(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_OTHER_CHECKSUM="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid tools archive checksum file", result.stderr)
+        self.assert_no_install()
+
+    def test_unknown_missing_and_extra_arguments_are_rejected(self):
+        for args in ((), ("unknown",), ("docker",), ("native", "extra"),
+                     ("docker", "agh", "dns", "extra")):
+            with self.subTest(args=args):
+                result = self.run_bootstrap(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Usage:", result.stderr)
+                self.assertEqual(self.calls, [])
+
+    def test_invalid_container_and_service_names_are_rejected(self):
+        for name in ("", "--unsafe", ".hidden", "two words", "agh\ndns", "$(id)"):
+            for args in (("docker", name), ("docker", "agh", name)):
+                with self.subTest(args=args):
+                    result = self.run_bootstrap(*args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Invalid Docker", result.stderr)
+                    self.assertEqual(self.calls, [])
+
+    def test_root_is_required_before_version_or_network(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_UID="1000")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sudo/root", result.stderr)
+        self.assertEqual([call["name"] for call in self.calls], ["id"])
+
+    def test_malformed_version_stops_before_download(self):
+        for output in ("AdGuard Home, version unknown", "AdGuard Home, version v1.2",
+                       "AdGuard Home, version v1.2.3/unsafe", "conversion v1.2.3"):
+            with self.subTest(output=output):
+                result = self.run_bootstrap("native", BOOTSTRAP_VERSION=output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid or missing", result.stderr)
+                self.assertFalse(any(call["name"] == "curl" for call in self.calls))
+                self.assert_no_install()
+
+    def test_version_command_failure_stops_before_download(self):
+        for args in (("native",), ("docker", "agh")):
+            with self.subTest(args=args):
+                result = self.run_bootstrap(*args, BOOTSTRAP_VERSION_FAIL="1")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(call["name"] == "curl" for call in self.calls))
+                self.assert_no_install()
+
+    def test_prerelease_version_uses_matching_release_url(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_VERSION="AdGuard Home, version v1.2.3-beta.4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        download = next(call for call in self.calls if call["name"] == "curl")
+        self.assertIn("https://github.com/rdna897/adguardhome-patcher/releases/download/ui-v1.2.3-beta.4/" +
+                      identity.TOOLS_ASSET, download["args"])
+
+    def test_download_failure_cleans_temporary_directory(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_DOWNLOAD_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_no_install()
+
+    def test_extraction_failure_does_not_invoke_installer(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_TAR_EXIT="2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(call["name"] == "sh" for call in self.calls))
+
+    def test_released_installer_failure_is_propagated_and_cleaned_up(self):
+        result = self.run_bootstrap("native", BOOTSTRAP_INSTALL_EXIT="17")
+        self.assertEqual(result.returncode, 17)
 
 
 class ManualPatcher(unittest.TestCase):
