@@ -18,11 +18,37 @@ Frontend improvements for the official AdGuard Home binary and Docker image. AdG
 
 ## Install
 
-Install from the [versioned GitHub Releases](https://github.com/rdna897/adguardhome-patcher/releases). The repository and source archive are for development/source distribution.
+Run the bootstrap installer on the host. It reads your installed AdGuard Home version, downloads `agh-patcher-tools.tar.gz` from the matching `ui-<version>` [GitHub Release](https://github.com/rdna897/adguardhome-patcher/releases), verifies its SHA-256 checksum, extracts it to `/opt/adguardhome-patcher` and runs the released installer. That installer verifies the released files and exact version, installs the manual CLI and launcher, and preserves any installed frontend. Installation does not download a frontend or restart AdGuard Home.
 
-Choose the release matching your **installed AdGuard Home version**. Check it with `/opt/AdGuardHome/AdGuardHome --version` (native) or `docker exec adguardhome /opt/adguardhome/AdGuardHome --version` (Docker). Set `AGH_VERSION` below to that version, including the `v` prefix.
+### Native
 
-Download, verify and extract the released tools on the host:
+```sh
+curl -fsSL https://raw.githubusercontent.com/rdna897/adguardhome-patcher/main/install.sh -o /tmp/agh-patcher-install.sh
+sudo sh /tmp/agh-patcher-install.sh native
+agh-patcher check
+sudo agh-patcher update
+```
+
+The binary defaults to `/opt/AdGuardHome`. For a custom directory, run `sudo env AGH_DIR=/your/AdGuardHome sh /tmp/agh-patcher-install.sh native`.
+
+### Docker
+
+Run the bootstrap on the host, then apply the managed override from your Compose directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rdna897/adguardhome-patcher/main/install.sh -o /tmp/agh-patcher-install.sh
+sudo sh /tmp/agh-patcher-install.sh docker adguardhome
+sudo docker compose -f compose.yaml \
+  -f /opt/adguardhome-patcher/compose.patcher.yaml up -d adguardhome
+agh-patcher check
+sudo agh-patcher update
+```
+
+Docker mode takes `<container-name> [compose-service-name]`; the service defaults to the container's Compose label, then its container name. For different names, use e.g. `docker agh-container dns` and `up -d dns`. Use your actual base Compose filename. The patcher owns the override; your base file and data volumes remain administrator-owned. The managed override does not replace the base service command or administrator Compose settings. Keep using both files for Docker operations.
+
+### Manual install
+
+Alternatively, set `AGH_VERSION` to your installed AdGuard Home version, including the `v` prefix, then download, verify and extract the released tools yourself:
 
 ```sh
 AGH_VERSION=v0.107.79
@@ -41,31 +67,7 @@ AGH_VERSION=v0.107.79
 )
 ```
 
-Run the installer for your installation below. It verifies the released files and exact version, installs the manual CLI and launcher, and preserves any installed frontend. It does not download a frontend or restart AdGuard Home.
-
-### Native
-
-```sh
-sudo sh /opt/adguardhome-patcher/install/native/install.sh
-agh-patcher check
-sudo agh-patcher update
-```
-
-The binary defaults to `/opt/AdGuardHome`. For a custom directory, run the installer with `sudo env AGH_DIR=/your/AdGuardHome sh /opt/adguardhome-patcher/install/native/install.sh`.
-
-### Docker
-
-Run the installer on the host, then apply its managed override from your Compose directory:
-
-```sh
-sudo sh /opt/adguardhome-patcher/install/docker/install.sh adguardhome
-sudo docker compose -f compose.yaml \
-  -f /opt/adguardhome-patcher/compose.patcher.yaml up -d adguardhome
-agh-patcher check
-sudo agh-patcher update
-```
-
-The installer takes `<container-name> [compose-service-name]`; the service defaults to the container's Compose label, then its container name. For different names, use e.g. `install.sh agh-container dns` and `up -d dns`. Use your actual base Compose filename. The patcher owns the override; your base file and data volumes remain administrator-owned. The managed override does not replace the base service command or administrator Compose settings. Keep using both files for Docker operations.
+Then run `sudo sh /opt/adguardhome-patcher/install/native/install.sh` (with `env AGH_DIR=...` for a custom directory) or `sudo sh /opt/adguardhome-patcher/install/docker/install.sh <container-name> [compose-service-name]`.
 
 ## Update
 
@@ -77,7 +79,7 @@ sudo agh-patcher update
 
 `status` is local and read-only. `check` reads the compatible release and reports frontend and tooling updates separately. `update` verifies the frontend and asks you to type `yes` before replacing files and restarting AdGuard Home; `--yes` explicitly skips the prompt. A tooling-only update does not replace or restart the frontend.
 
-To update management tooling, repeat the release download/verification above and rerun your installer. Docker setup regenerates its override without restarting the container; if `check` reports it is not active, run the Compose command above explicitly. After changing the Docker image or base service command, recreate with the base Compose file only, rerun the compatible released Docker installer, then reapply the managed override. Hard-refresh your browser after a frontend update.
+To update management tooling, rerun the bootstrap installer (or the manual install). Docker setup regenerates its override without restarting the container; if `check` reports it is not active, run the Compose command above explicitly. After changing the Docker image or base service command, recreate with the base Compose file only, rerun the compatible released Docker installer, then reapply the managed override. Hard-refresh your browser after a frontend update.
 
 ## Uninstall
 

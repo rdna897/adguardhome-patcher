@@ -22,6 +22,11 @@ spec.loader.exec_module(p)
 spec = importlib.util.spec_from_file_location("identity", SOURCE / "scripts/release-manifest.py")
 identity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(identity)
+# Run the root install.sh bootstrap tests in the existing release gate.
+spec = importlib.util.spec_from_file_location("bootstrap_tests", SOURCE / "scripts/tests/test-bootstrap.py")
+bootstrap_tests = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bootstrap_tests)
+Bootstrap = bootstrap_tests.Bootstrap
 VERSION = "v0.107.79"
 SOURCE_COMMIT = subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip()
 
