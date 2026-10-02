@@ -109,6 +109,18 @@ actual=$(sha256sum <"$work/$asset" | cut -d ' ' -f 1)
 [ "$actual" = "$expected" ] || fail "checksum mismatch for $asset; nothing was installed"
 echo "Verified $asset SHA-256 $actual"
 
+# Reject unsafe privileged destinations before creating or extracting anything.
+if [ -L "$tools_dir" ]; then
+	fail "refusing symlinked tools directory: $tools_dir"
+fi
+if [ -e "$tools_dir" ] && [ ! -d "$tools_dir" ]; then
+	fail "tools path exists and is not a directory: $tools_dir"
+fi
+tools_parent=${tools_dir%/*}
+if [ -L "$tools_parent" ]; then
+	fail "refusing symlinked tools parent directory: $tools_parent"
+fi
+
 # Files outside the bundle (installed UI, managed Compose override) are kept.
 mkdir -p "$tools_dir"
 tar --no-same-owner --no-same-permissions -xzf "$work/$asset" -C "$tools_dir" \

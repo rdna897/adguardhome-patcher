@@ -111,6 +111,47 @@ class Bootstrap(unittest.TestCase):
         self.assertTrue(all(line.startswith("-fsSL --proto =https") and "--retry 3" in line
                             for line in self.logged("curl-args")))
 
+    def assert_unsafe_destination(self, message):
+        (self.bin / "tar").unlink()
+        self.fake("tar", 'echo extraction >>"$FAKE_LOG/tar"\nexit 1\n')
+        result = self.run_bootstrap("native", AGH_DIR=str(self.agh_dir))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertEqual(self.logged("tar"), [], "archive extraction was attempted")
+        self.assertEqual(self.logged("handoff"), [])
+
+    def test_symlinked_tools_directory_is_rejected_without_modifying_target(self):
+        target = self.root / "redirected"
+        self.tools.rename(target)
+        self.tools.symlink_to(target, target_is_directory=True)
+        before = {str(path.relative_to(target)): path.read_bytes() if path.is_file() else None
+                  for path in target.rglob("*")}
+        self.assert_unsafe_destination("refusing symlinked tools directory")
+        self.assertTrue(self.tools.is_symlink())
+        self.assertEqual(self.tools.readlink(), target)
+        self.assertEqual({str(path.relative_to(target)): path.read_bytes() if path.is_file() else None
+                          for path in target.rglob("*")}, before)
+
+    def test_non_directory_tools_destination_is_rejected_without_modifying_file(self):
+        shutil.rmtree(self.tools)
+        self.tools.write_text("existing file\n")
+        self.assert_unsafe_destination("tools path exists and is not a directory")
+        self.assertTrue(self.tools.is_file())
+        self.assertEqual(self.tools.read_text(), "existing file\n")
+
+    def test_symlinked_tools_parent_is_rejected_without_modifying_target(self):
+        parent = self.tools.parent
+        target = self.root / "redirected-opt"
+        parent.rename(target)
+        parent.symlink_to(target, target_is_directory=True)
+        before = {str(path.relative_to(target)): path.read_bytes() if path.is_file() else None
+                  for path in target.rglob("*")}
+        self.assert_unsafe_destination("refusing symlinked tools parent directory")
+        self.assertTrue(parent.is_symlink())
+        self.assertEqual(parent.readlink(), target)
+        self.assertEqual({str(path.relative_to(target)): path.read_bytes() if path.is_file() else None
+                          for path in target.rglob("*")}, before)
+
     def test_native_detects_version_and_hands_off_with_agh_dir(self):
         result = self.run_bootstrap("native", AGH_DIR=str(self.agh_dir))
         self.assertEqual(result.returncode, 0, result.stderr)
