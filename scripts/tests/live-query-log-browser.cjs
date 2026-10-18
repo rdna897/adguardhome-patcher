@@ -6,7 +6,9 @@ const { createRequire } = require('node:module');
 
 const source = path.resolve(process.argv[2] || '.');
 const upstreamRequire = createRequire(path.join(source, 'client/package.json'));
-const { chromium, expect } = upstreamRequire('@playwright/test');
+const { chromium, expect: baseExpect } = upstreamRequire('@playwright/test');
+// Keep real transport/render waits separate from the controlled five-second API budget.
+const expect = baseExpect.configure({ timeout: 15000 });
 const staticRoot = path.join(source, 'build/static');
 
 const rawRow = (id, domain = 'google.com') => ({
@@ -20,7 +22,7 @@ const rawRow = (id, domain = 'google.com') => ({
 async function check(browser, viewport) {
     const context = await browser.newContext({ viewport, locale: 'en-US' });
     const page = await context.newPage();
-    page.setDefaultTimeout(5000);
+    page.setDefaultTimeout(15000);
     const errors = [];
     const consoleErrors = [];
     const endpoints = [];

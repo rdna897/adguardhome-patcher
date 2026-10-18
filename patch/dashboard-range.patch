@@ -855,19 +855,20 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..7260a6e
+index 0000000..20d952e
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,624 @@
 +import React, { useRef } from 'react';
 +import ReactDOM from 'react-dom';
 +import { act } from 'react-dom/test-utils';
 +import { Provider } from 'react-redux';
-+import { combineReducers, createStore } from 'redux';
++import { applyMiddleware, combineReducers, createStore } from 'redux';
++import thunk from 'redux-thunk';
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import apiClient from '../api/Api';
-+import { getLogsRequest, getLogsSuccess, setLogsFilter, updateLogs } from '../actions/queryLogs';
++import { getLogsRequest, getLogsSuccess, refreshFilteredLogs, setLogsFilter, updateLogs } from '../actions/queryLogs';
 +import queryLogs from '../reducers/queryLogs';
 +import { useLiveQueryLog } from '../components/Logs/useLiveQueryLog';
 +import { LIVE_LOG_STORAGE_KEY } from '../helpers/liveQueryLog';
@@ -926,7 +927,7 @@ index 0000000..7260a6e
 +        store = createStore(reducer, {
 +            ...reducer(undefined, { type: '@@init', payload: undefined }),
 +            queryLogs: { ...queryLogs(undefined, { type: '@@init', payload: undefined }), processingGetLogs: false },
-+        });
++        }, applyMiddleware(thunk));
 +    });
 +
 +    afterEach(() => {
@@ -1416,21 +1417,89 @@ index 0000000..7260a6e
 +        expect(controls.status).toBe('gap');
 +    });
 +
++    it('recovers every arrival after a partial failure following an empty baseline', async () => {
++        const records = dataset(0);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250));
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: records[99].time })
++            .mockRejectedValueOnce(new Error('Unavailable'));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(100);
++        expect(controls.status).toBe('reconnecting');
++        await tick(5000);
++        expect(store.getState().queryLogs.logs.map((row: any) => row.time)).toEqual(records.map((row) => row.time));
++        expect(controls.status).toBe('synced');
++        expect(controls.hasGap).toBe(false);
++    });
++
++    it('retains the old checkpoint when a visibility-aborted page settles after its deadline', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250, 1));
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: records[99].time })
++            .mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        await tick();
++        visibility('hidden');
++        visibility('visible');
++        await tick(6000);
++        await act(async () => resolve({ data: records.slice(100, 200), oldest: records[199].time }));
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++        expect(controls.hasGap).toBe(false);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(251);
++        expect(controls.status).toBe('synced');
++        expect(controls.hasGap).toBe(false);
++    });
++
++    it('Clear view cancels a pending same-filter refresh and suppresses its late response', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        let refresh: Promise<void>;
++        act(() => { refresh = store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.processingGetLogs).toBe(true);
++        const signal = vi.mocked(apiClient.getQueryLog).mock.calls[1][1];
++        act(() => controls.clearView());
++        expect(signal.aborted).toBe(true);
++        await act(async () => { resolve(response(1)); await refresh; });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        expect(store.getState().queryLogs.processingGetLogs).toBe(false);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(2));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++    });
++
 +});
 diff --git a/client/src/actions/queryLogs.ts b/client/src/actions/queryLogs.ts
-index 70dc568..1711924 100644
+index 70dc568..06b03eb 100644
 --- a/client/src/actions/queryLogs.ts
 +++ b/client/src/actions/queryLogs.ts
-@@ -7,12 +7,21 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
+@@ -7,12 +7,24 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
  import { addErrorToast, addSuccessToast } from './toasts';
  import { SearchFormValues } from '../components/Logs';
  
 -const getLogsWithParams = async (config: any) => {
 +let logsRequest: AbortController;
 +let logsGeneration = 0;
-+const startLogsRequest = () => {
++export const cancelLogsRequest = () => {
 +    logsRequest?.abort();
 +    logsGeneration += 1;
++};
++const startLogsRequest = () => {
++    cancelLogsRequest();
 +    logsRequest = new AbortController();
 +    return { signal: logsRequest.signal, generation: logsGeneration };
 +};
@@ -1445,7 +1514,7 @@ index 70dc568..1711924 100644
      const { data, oldest } = rawLogs;
  
      return {
-@@ -28,9 +37,14 @@ export const getAdditionalLogsRequest = createAction('GET_ADDITIONAL_LOGS_REQUES
+@@ -28,9 +40,14 @@ export const getAdditionalLogsRequest = createAction('GET_ADDITIONAL_LOGS_REQUES
  export const getAdditionalLogsFailure = createAction('GET_ADDITIONAL_LOGS_FAILURE');
  export const getAdditionalLogsSuccess = createAction('GET_ADDITIONAL_LOGS_SUCCESS');
  
@@ -1461,7 +1530,7 @@ index 70dc568..1711924 100644
  
      const previousQuery = filter?.search;
      const isQueryTheSame =
-@@ -48,18 +62,23 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
+@@ -48,18 +65,23 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
              const additionalLogs = await getLogsWithParams({
                  older_than: oldest,
                  filter,
@@ -1490,7 +1559,7 @@ index 70dc568..1711924 100644
          }
      }
  
-@@ -67,49 +86,45 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
+@@ -67,49 +89,44 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
      return totalData;
  };
  
@@ -1500,8 +1569,7 @@ index 70dc568..1711924 100644
 +export const clearLiveLogsView = createAction('CLEAR_LIVE_LOGS_VIEW');
 +const resetLogsViewRequest = createAction('RESET_LOGS_VIEW');
 +export const resetLogsView = () => {
-+    logsRequest?.abort();
-+    logsGeneration += 1;
++    cancelLogsRequest();
 +    return resetLogsViewRequest();
 +};
 +
@@ -1567,7 +1635,7 @@ index 70dc568..1711924 100644
      }
  };
  
-@@ -129,27 +144,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
+@@ -129,27 +146,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
  export const setFilteredLogsSuccess = createAction('SET_FILTERED_LOGS_SUCCESS');
  
  export const setFilteredLogs = (filter?: SearchFormValues) => async (dispatch: any) => {
@@ -2372,16 +2440,18 @@ index 8f9013b..b2bf4f9 100644
                  isSmallScreen={isSmallScreen}
 diff --git a/client/src/components/Logs/useLiveQueryLog.ts b/client/src/components/Logs/useLiveQueryLog.ts
 new file mode 100644
-index 0000000..5616a37
+index 0000000..53ce8ff
 --- /dev/null
 +++ b/client/src/components/Logs/useLiveQueryLog.ts
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,255 @@
 +import { RefObject, useCallback, useEffect, useRef, useState } from 'react';
 +import { shallowEqual, useDispatch, useSelector } from 'react-redux';
 +
 +import apiClient from '../../api/Api';
 +import { addErrorToast } from '../../actions/toasts';
-+import { clearLiveLogsView, receiveLiveLogs, revealPendingLogs, setLiveLogsEnabled } from '../../actions/queryLogs';
++import {
++    cancelLogsRequest, clearLiveLogsView, receiveLiveLogs, revealPendingLogs, setLiveLogsEnabled,
++} from '../../actions/queryLogs';
 +import { normalizeLogs } from '../../helpers/helpers';
 +import {
 +    LIVE_LOG_INTERVAL_MS, LIVE_LOG_PAGE_SIZE, LIVE_LOG_RETRY_MS,
@@ -2458,6 +2528,7 @@ index 0000000..5616a37
 +        let stopped = false;
 +        let timer: ReturnType<typeof setTimeout>;
 +        let controller: AbortController;
++        let cancelForAvailability: () => void;
 +        const generation = clearGeneration.current;
 +        const currentFilter = JSON.parse(filterKey);
 +        const current = () => !stopped && active.current && latestFilter.current === filterKey
@@ -2476,6 +2547,7 @@ index 0000000..5616a37
 +            controller = new AbortController();
 +            abort.current = controller;
 +            let timedOut = false;
++            let interrupted = false;
 +            let newestPage: any[];
 +            const processed = new Map<string, any>();
 +            const fromTime = checkpoint.current?.time;
@@ -2484,6 +2556,11 @@ index 0000000..5616a37
 +                timedOut = true;
 +                controller.abort();
 +            }, LIVE_LOG_RECOVERY_MAX_DURATION_MS);
++            cancelForAvailability = () => {
++                interrupted = true;
++                clearTimeout(deadline);
++                controller.abort();
++            };
 +            try {
 +                const result = await recoverLiveLogs(async (olderThan?: string) => {
 +                    const response = await apiClient.getQueryLog({
@@ -2527,7 +2604,7 @@ index 0000000..5616a37
 +                    setPhase('synced');
 +                }
 +            } catch (error) {
-+                if (current() && available() && (timedOut || !controller.signal.aborted)) {
++                if (current() && available() && !interrupted && (timedOut || !controller.signal.aborted)) {
 +                    if (timedOut && newestPage) {
 +                        // Accept a new boundary only with a persistent gap warning, so a slow
 +                        // backfill is not restarted on every retry. Keep successfully read rows.
@@ -2554,6 +2631,7 @@ index 0000000..5616a37
 +                }
 +            } finally {
 +                clearTimeout(deadline);
++                cancelForAvailability = undefined;
 +                busy.current = false;
 +                clearTimeout(timer);
 +                if (current() && available()) {
@@ -2567,7 +2645,7 @@ index 0000000..5616a37
 +                setPhase('catching_up');
 +                timer = setTimeout(poll, 0);
 +            } else {
-+                controller?.abort();
++                cancelForAvailability?.();
 +                if (current()) setPhase(visible() ? 'reconnecting' : 'suspended');
 +            }
 +        };
@@ -2600,6 +2678,7 @@ index 0000000..5616a37
 +        // Invalidate synchronously so a queued old response cannot refill the cleared table.
 +        clearGeneration.current += 1;
 +        abort.current?.abort();
++        cancelLogsRequest();
 +        baselineOnly.current = checkpoint.current === null;
 +        dispatch(clearLiveLogsView({ through: observedHead.current }));
 +        setClearRevision((revision) => revision + 1);
@@ -2692,10 +2771,10 @@ index ba2de57..d4a8ffb 100644
 +};
 diff --git a/client/src/helpers/liveQueryLog.ts b/client/src/helpers/liveQueryLog.ts
 new file mode 100644
-index 0000000..ca9be79
+index 0000000..ee36ad7
 --- /dev/null
 +++ b/client/src/helpers/liveQueryLog.ts
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,147 @@
 +import i18next from 'i18next';
 +
 +import { LocalStorageHelper } from './localStorageHelper';
@@ -2771,7 +2850,8 @@ index 0000000..ca9be79
 +    // backfill as new arrivals or reinsert trimmed/cleared history on later polls.
 +    // A retry can recover rows older than those displayed after a partial response.
 +    // Its independent acquisition checkpoint permits these rows despite UI trimming.
-+    const floor = fromTime && state.liveFloor && compareTimes(fromTime, state.liveFloor) < 0
++    const floor = fromTime !== undefined
++        && (!fromTime || (state.liveFloor && compareTimes(fromTime, state.liveFloor) < 0))
 +        ? fromTime : state.liveFloor;
 +    const added = batch.filter((row) => !seen.has(row.liveKey)
 +        && (!floor || compareTimes(row.time, floor) >= 0)
@@ -3233,10 +3313,10 @@ index 7cc2855..c4c04ab 100644
          processingClear: false,
          processingGetConfig: false,
 diff --git a/client/src/reducers/queryLogs.ts b/client/src/reducers/queryLogs.ts
-index 7a05928..80c3a1f 100644
+index 7a05928..55f2838 100644
 --- a/client/src/reducers/queryLogs.ts
 +++ b/client/src/reducers/queryLogs.ts
-@@ -1,10 +1,60 @@
+@@ -1,10 +1,61 @@
  import { handleActions } from 'redux-actions';
  
 +import { compareTimes, createLiveLogView, mergeLiveLogView, revealLiveLogs } from '../helpers/liveQueryLog';
@@ -3287,7 +3367,8 @@ index 7a05928..80c3a1f 100644
 +                ? through : state.liveNewest;
 +            return {
 +                ...state, logs: [], livePending: [], liveClearedThrough: boundary,
-+                liveFloor: boundary, oldest: '', isEntireLog: true,
++                liveFloor: boundary, oldest: '', isEntireLog: true, processingGetLogs: false,
++                processingAdditionalLogs: false,
 +            };
 +        },
 +        [actions.resetLogsView.toString()]: (state: any) => ({
@@ -3297,7 +3378,7 @@ index 7a05928..80c3a1f 100644
          [actions.setFilteredLogsRequest.toString()]: (state: any) => ({
              ...state,
              processingGetLogs: true,
-@@ -28,7 +78,7 @@ const queryLogs = handleActions(
+@@ -28,7 +79,7 @@ const queryLogs = handleActions(
                  oldest,
                  filter,
                  isFiltered,
@@ -3306,7 +3387,7 @@ index 7a05928..80c3a1f 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -50,10 +100,11 @@ const queryLogs = handleActions(
+@@ -50,10 +101,11 @@ const queryLogs = handleActions(
          [actions.getLogsSuccess.toString()]: (state: any, { payload }: any) => {
              const { logs, oldest, older_than } = payload;
  
@@ -3319,7 +3400,7 @@ index 7a05928..80c3a1f 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -129,6 +180,12 @@ const queryLogs = handleActions(
+@@ -129,6 +181,12 @@ const queryLogs = handleActions(
          processingAdditionalLogs: false,
          interval: DAY,
          logs: [],
