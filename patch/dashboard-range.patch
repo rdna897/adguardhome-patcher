@@ -666,10 +666,10 @@ index 0000000..9803f10
 +});
 diff --git a/client/src/__tests__/queryLogsRequests.test.ts b/client/src/__tests__/queryLogsRequests.test.ts
 new file mode 100644
-index 0000000..88922aa
+index 0000000..91cbda5
 --- /dev/null
 +++ b/client/src/__tests__/queryLogsRequests.test.ts
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,159 @@
 +import { beforeEach, describe, expect, it, vi } from 'vitest';
 +import { applyMiddleware, combineReducers, createStore } from 'redux';
 +import thunk from 'redux-thunk';
@@ -679,8 +679,8 @@ index 0000000..88922aa
 +import access from '../reducers/access';
 +import { toggleClientBlock } from '../actions/access';
 +import {
-+    getLogs, getLogsRequest, getLogsSuccess, receiveLiveLogs, resetLogsView,
-+    revealPendingLogs, setFilteredLogs, setLiveLogsEnabled, updateLogs,
++    clearLiveLogsView, getLogs, getLogsRequest, getLogsSuccess, receiveLiveLogs, resetLogsView,
++    revealPendingLogs, setFilteredLogs, setFilteredLogsSuccess, setLiveLogsEnabled, updateLogs,
 +} from '../actions/queryLogs';
 +import { normalizeLogs } from '../helpers/helpers';
 +
@@ -811,6 +811,23 @@ index 0000000..88922aa
 +        expect(store.getState().logs.map((row: any) => row.time)).toEqual([rawRow(2).time, rawRow(1).time]);
 +        expect(store.getState().oldest).toBe(rawRow(1).time);
 +    });
++    it('resets populated Live state and filter boundaries when leaving the page', () => {
++        const { store, dispatch } = makeStore();
++        dispatch(setLiveLogsEnabled(true));
++        dispatch(setFilteredLogsSuccess({
++            logs: normalizeLogs([rawRow(1)]), oldest: rawRow(1).time,
++            filter: { search: 'google.com', response_status: 'blocked' },
++        }));
++        dispatch(clearLiveLogsView({ through: rawRow(1).time }));
++        dispatch(receiveLiveLogs({ logs: normalizeLogs([rawRow(2)]), atTop: false }));
++        expect(store.getState().livePending).toHaveLength(1);
++        dispatch(resetLogsView());
++        expect(store.getState()).toMatchObject({
++            logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '',
++            liveEnabled: false, filter: { search: '', response_status: 'all' }, processingGetLogs: false,
++        });
++    });
++
 +});
 diff --git a/client/src/__tests__/statsRange.test.ts b/client/src/__tests__/statsRange.test.ts
 new file mode 100644
@@ -855,7 +872,7 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..0f403e1
+index 0000000..1174e3b
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
 @@ -0,0 +1,676 @@
@@ -1523,7 +1540,7 @@ index 0000000..0f403e1
 +        await tick();
 +        act(() => controls.clearView());
 +        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
-+        const filter = store.getState().queryLogs.filter;
++        const { filter } = store.getState().queryLogs;
 +        vi.mocked(apiClient.getQueryLog).mockRejectedValueOnce(new Error('Unavailable'));
 +        await act(async () => {
 +            await store.dispatch(setFilteredLogs({ search: 'new.example', response_status: 'all' }));
@@ -1536,7 +1553,7 @@ index 0000000..0f403e1
 +
 +});
 diff --git a/client/src/actions/queryLogs.ts b/client/src/actions/queryLogs.ts
-index 70dc568..06b03eb 100644
+index 70dc568..cf8debe 100644
 --- a/client/src/actions/queryLogs.ts
 +++ b/client/src/actions/queryLogs.ts
 @@ -7,12 +7,24 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
@@ -1619,7 +1636,7 @@ index 70dc568..06b03eb 100644
 +export const receiveLiveLogs = createAction('RECEIVE_LIVE_LOGS');
 +export const revealPendingLogs = createAction('REVEAL_PENDING_LOGS');
 +export const clearLiveLogsView = createAction('CLEAR_LIVE_LOGS_VIEW');
-+const resetLogsViewRequest = createAction('RESET_LOGS_VIEW');
++export const resetLogsViewRequest = createAction('RESET_LOGS_VIEW');
 +export const resetLogsView = () => {
 +    cancelLogsRequest();
 +    return resetLogsViewRequest();
@@ -3365,7 +3382,7 @@ index 7cc2855..c4c04ab 100644
          processingClear: false,
          processingGetConfig: false,
 diff --git a/client/src/reducers/queryLogs.ts b/client/src/reducers/queryLogs.ts
-index 7a05928..9655ed2 100644
+index 7a05928..9426fbf 100644
 --- a/client/src/reducers/queryLogs.ts
 +++ b/client/src/reducers/queryLogs.ts
 @@ -1,10 +1,63 @@
@@ -3425,7 +3442,7 @@ index 7a05928..9655ed2 100644
 +                processingAdditionalLogs: false,
 +            };
 +        },
-+        [actions.resetLogsView.toString()]: (state: any) => ({
++        [actions.resetLogsViewRequest.toString()]: (state: any) => ({
 +            ...state, logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '', liveEnabled: false,
 +            filter: DEFAULT_LOGS_FILTER, oldest: '', isEntireLog: false, processingGetLogs: false,
 +        }),
