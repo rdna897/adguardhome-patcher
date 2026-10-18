@@ -27,7 +27,7 @@ The small status beside the controls uses a polite, atomic screen-reader status 
 - **Gap detected:** recovery could not verify continuity. This bordered warning remains visible alongside reconnecting, catching-up or paused status when applicable.
 - **Paused:** Live View was intentionally disabled. Existing non-live history pagination remains available.
 
-**Clear view** cancels the current Live cycle and removes only browser rows. It keeps the checkpoint and suppresses all records at or below the newest observed timestamp, including indistinguishable records at the clear boundary. If cleared before any Live baseline is available, the next successful page becomes an empty-view baseline. That intentionally omits arrivals before that baseline, since they cannot be distinguished from cleared history. A new filter or page session starts its own view. Clear view never calls the server clear endpoint, changes server-side history, or alters AdGuard Home's storage.
+**Clear view** cancels the current Live cycle and any pending history refresh, and removes only browser rows. It keeps the checkpoint and suppresses all records at or below the newest observed timestamp, including indistinguishable records at the clear boundary. If cleared before any Live baseline is available, the next successful page becomes an empty-view baseline. That intentionally omits arrivals before that baseline, since they cannot be distinguished from cleared history. A new filter or page session starts its own view. Clear view never calls the server clear endpoint, changes server-side history, or alters AdGuard Home's storage.
 
 ## API limits
 

@@ -855,10 +855,10 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..20d952e
+index 0000000..797615d
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,645 @@
 +import React, { useRef } from 'react';
 +import ReactDOM from 'react-dom';
 +import { act } from 'react-dom/test-utils';
@@ -868,7 +868,7 @@ index 0000000..20d952e
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import apiClient from '../api/Api';
-+import { getLogsRequest, getLogsSuccess, refreshFilteredLogs, setLogsFilter, updateLogs } from '../actions/queryLogs';
++import { getLogsRequest, getLogsSuccess, refreshFilteredLogs, setFilteredLogs, setLogsFilter, updateLogs } from '../actions/queryLogs';
 +import queryLogs from '../reducers/queryLogs';
 +import { useLiveQueryLog } from '../components/Logs/useLiveQueryLog';
 +import { LIVE_LOG_STORAGE_KEY } from '../helpers/liveQueryLog';
@@ -1482,9 +1482,30 @@ index 0000000..20d952e
 +        expect(store.getState().queryLogs.logs).toHaveLength(1);
 +    });
 +
++    it('retains Clear view through a later same-filter refresh and resets it for a new filter', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        act(() => controls.clearView());
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(2));
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs.map((row: any) => row.time)).toEqual([rawRow(2).time]);
++        await act(async () => {
++            await store.dispatch(setFilteredLogs({ search: 'new.example', response_status: 'all' }));
++        });
++        expect(store.getState().queryLogs.liveClearedThrough).toBe('');
++        expect(store.getState().queryLogs.logs).toHaveLength(2);
++    });
++
 +});
 diff --git a/client/src/actions/queryLogs.ts b/client/src/actions/queryLogs.ts
-index 70dc568..06b03eb 100644
+index 70dc568..b3cdde8 100644
 --- a/client/src/actions/queryLogs.ts
 +++ b/client/src/actions/queryLogs.ts
 @@ -7,12 +7,24 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
@@ -1639,8 +1660,9 @@ index 70dc568..06b03eb 100644
  export const setFilteredLogsSuccess = createAction('SET_FILTERED_LOGS_SUCCESS');
  
  export const setFilteredLogs = (filter?: SearchFormValues) => async (dispatch: any) => {
+-    dispatch(setFilteredLogsRequest());
 +    const { signal, generation } = startLogsRequest();
-     dispatch(setFilteredLogsRequest());
++    dispatch(setFilteredLogsRequest(filter));
      try {
 -        const data = await getLogsWithParams({
 -            older_than: '',
@@ -3313,10 +3335,10 @@ index 7cc2855..c4c04ab 100644
          processingClear: false,
          processingGetConfig: false,
 diff --git a/client/src/reducers/queryLogs.ts b/client/src/reducers/queryLogs.ts
-index 7a05928..55f2838 100644
+index 7a05928..2fa09d8 100644
 --- a/client/src/reducers/queryLogs.ts
 +++ b/client/src/reducers/queryLogs.ts
-@@ -1,10 +1,61 @@
+@@ -1,12 +1,67 @@
  import { handleActions } from 'redux-actions';
  
 +import { compareTimes, createLiveLogView, mergeLiveLogView, revealLiveLogs } from '../helpers/liveQueryLog';
@@ -3324,10 +3346,14 @@ index 7a05928..55f2838 100644
  import * as actions from '../actions/queryLogs';
  import { DEFAULT_LOGS_FILTER, DAY, QUERY_LOG_INTERVALS_DAYS, HOUR } from '../helpers/constants';
  
++const filterChanged = (previous: any, next: any) => Object.keys({ ...previous, ...next })
++    .some((key) => previous?.[key] !== next?.[key]);
++
  const queryLogs = handleActions(
      {
+-        [actions.setFilteredLogsRequest.toString()]: (state: any) => ({
 +        [actions.updateLogs.toString()]: (state: any) => ({
-+            ...state,
+             ...state,
 +            // Preserve the live window and any active filter/server request.
 +            isEntireLog: state.liveEnabled ? state.isEntireLog : state.logs.length < 1,
 +            processingGetLogs: state.liveEnabled ? state.processingGetLogs : false,
@@ -3375,19 +3401,46 @@ index 7a05928..55f2838 100644
 +            ...state, logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '', liveEnabled: false,
 +            filter: DEFAULT_LOGS_FILTER, oldest: '', isEntireLog: false, processingGetLogs: false,
 +        }),
-         [actions.setFilteredLogsRequest.toString()]: (state: any) => ({
-             ...state,
++        [actions.setFilteredLogsRequest.toString()]: (state: any, { payload }: any) => ({
++            ...state,
++            ...(filterChanged(state.filter, payload) ? { liveClearedThrough: '' } : {}),
              processingGetLogs: true,
-@@ -28,7 +79,7 @@ const queryLogs = handleActions(
+         }),
+         [actions.setFilteredLogsFailure.toString()]: (state: any) => ({
+@@ -22,22 +77,27 @@ const queryLogs = handleActions(
+             const { logs, oldest, filter } = payload;
+ 
+             const isFiltered = filter && Object.keys(filter).some((key) => filter[key]);
++            const boundary = state.liveClearedThrough;
++            const view = state.liveEnabled ? {
++                ...createLiveLogView(logs.filter((row: any) => !boundary || compareTimes(row.time, boundary) > 0)),
++                liveClearedThrough: boundary,
++            } : { logs, livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: boundary };
+ 
+             return {
+                 ...state,
                  oldest,
                  filter,
                  isFiltered,
 -                logs,
-+                ...(state.liveEnabled ? createLiveLogView(logs) : { logs, livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '' }),
++                ...view,
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -50,10 +101,11 @@ const queryLogs = handleActions(
+         },
+ 
+-        [actions.setLogsFilterRequest.toString()]: (state, { payload }: any) => ({
+-            ...state,
+-            filter: payload,
+-        }),
++        [actions.setLogsFilterRequest.toString()]: (state: any, { payload }: any) => {
++            const changed = filterChanged(state.filter, payload);
++            return { ...state, filter: payload, ...(changed ? { liveClearedThrough: '' } : {}) };
++        },
+ 
+         [actions.getLogsRequest.toString()]: (state: any) => ({
+             ...state,
+@@ -50,10 +110,11 @@ const queryLogs = handleActions(
          [actions.getLogsSuccess.toString()]: (state: any, { payload }: any) => {
              const { logs, oldest, older_than } = payload;
  
@@ -3400,7 +3453,7 @@ index 7a05928..55f2838 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -129,6 +181,12 @@ const queryLogs = handleActions(
+@@ -129,6 +190,12 @@ const queryLogs = handleActions(
          processingAdditionalLogs: false,
          interval: DAY,
          logs: [],
