@@ -249,7 +249,10 @@ async function check(browser, viewport) {
         assert.deepEqual(await renderedDomains(), added.map(row => row.question.name),
             'Recovered rows are newest first, complete, and contain no duplicates');
     };
-    const assertPages = (requestStart, responseStart, count) => {
+    const assertPages = async (requestStart, responseStart, count) => {
+        // Route completion and React's cycle commit happen after browser fetch dispatch.
+        await expect.poll(() => requests.length - requestStart).toBe(count);
+        await expect.poll(() => responses.length - responseStart).toBe(count);
         const actual = requests.slice(requestStart);
         const pages = responses.slice(responseStart);
         assert.equal(actual.length, count, 'Recovery stops as soon as the newest checkpoint group overlaps');
@@ -448,7 +451,7 @@ async function check(browser, viewport) {
             await nextPoll();
             await expect(syncStatus).toHaveText(synced);
             await expectNewest(added);
-            assertPages(requestStart, responseStart, pageCount);
+            await assertPages(requestStart, responseStart, pageCount);
             await nextPoll();
             await expectNewest(added); // Overlap on the following poll cannot duplicate rows.
             await clearLocalView();
@@ -476,7 +479,7 @@ async function check(browser, viewport) {
         assert.equal(await liveCount(), heldCount, 'No second poll starts during an in-flight cursor request');
         await releaseLive();
         await expect(indicator).toHaveAccessibleName('500 new queries — Show newest');
-        assertPages(pendingRequestStart, pendingResponseStart, 6);
+        await assertPages(pendingRequestStart, pendingResponseStart, 6);
         await expectNewest(visible);
         assert.equal(await page.evaluate(() => scrollY), readingScroll);
         const latestPending = arrive(1);
@@ -558,14 +561,14 @@ async function check(browser, viewport) {
         const overflowRequestStart = requests.length;
         const overflowResponseStart = responses.length;
         await nextPoll();
-        assertPages(overflowRequestStart, overflowResponseStart, 10);
+        await assertPages(overflowRequestStart, overflowResponseStart, 10);
         await expect(syncStatus).toHaveText(gapText);
         await expectNewest(overflow.slice(0, 500));
         await checkControls(true); // Also exercise the long gap text at 320/390px in both themes.
         const rebasedRequests = requests.length;
         const rebasedResponses = responses.length;
         await nextPoll();
-        assertPages(rebasedRequests, rebasedResponses, 1);
+        await assertPages(rebasedRequests, rebasedResponses, 1);
         await expect(syncStatus).toHaveText(gapText);
         await expectNewest(overflow.slice(0, 500));
         await clearLocalView();
@@ -601,7 +604,7 @@ async function check(browser, viewport) {
         const timeRebaseRequests = requests.length;
         const timeRebaseResponses = responses.length;
         await nextPoll();
-        assertPages(timeRebaseRequests, timeRebaseResponses, 1);
+        await assertPages(timeRebaseRequests, timeRebaseResponses, 1);
         await expect(syncStatus).toHaveText(gapText);
         assert.equal(await page.evaluate(() => window.errorToastCount), deadlineToasts,
             'A budget gap cannot produce repeated outage toasts');
