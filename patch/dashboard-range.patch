@@ -222,12 +222,454 @@ index 0000000..b660f72
 +        expect(state.logs).toHaveLength(1);
 +    });
 +});
+diff --git a/client/src/__tests__/liveQueryLogRecovery.test.ts b/client/src/__tests__/liveQueryLogRecovery.test.ts
+new file mode 100644
+index 0000000..9803f10
+--- /dev/null
++++ b/client/src/__tests__/liveQueryLogRecovery.test.ts
+@@ -0,0 +1,436 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import { compareTimes, identifyLiveLogs, LiveLogRow } from '../helpers/liveQueryLog';
++import {
++    LIVE_LOG_RECOVERY_MAX_DURATION_MS, LIVE_LOG_RECOVERY_MAX_PAGES, LIVE_LOG_RECOVERY_MAX_ROWS,
++    LiveLogCheckpoint, LiveLogPage, recoverLiveLogs,
++} from '../helpers/liveQueryLogRecovery';
++
++const time = (value: number) => `2026-10-01T12:00:00.${String(value).padStart(9, '0')}Z`;
++const row = (value: number, extra = {}): LiveLogRow => ({
++    time: time(value), domain: 'example.test', client: '192.0.2.1', type: 'A', ...extra,
++});
++const rows = (count: number, offset = 0) => Array.from({ length: count }, (_, index) => row(count + offset - index));
++const checkpointFor = (entries: LiveLogRow[]): LiveLogCheckpoint => {
++    const identified = identifyLiveLogs([...entries].sort((left, right) => compareTimes(right.time, left.time)));
++    return {
++        time: identified[0]?.time || '',
++        keys: identified.filter((entry) => entry.time === identified[0].time).map((entry) => entry.liveKey!),
++    };
++};
++const baseline = () => checkpointFor([row(1)]);
++const emptyBaseline = (): LiveLogCheckpoint => ({ time: '', keys: [] });
++const page = (logs: LiveLogRow[], oldest = ''): LiveLogPage => ({ logs, oldest });
++const scripted = (...pages: LiveLogPage[]) => {
++    let index = 0;
++    return vi.fn(async (_olderThan?: string) => {
++        const next = pages[index];
++        index += 1;
++        if (!next) {
++            throw new Error('Unexpected extra fetch');
++        }
++        return next;
++    });
++};
++const history = (entries: LiveLogRow[]) => vi.fn(async (olderThan?: string): Promise<LiveLogPage> => {
++    const remaining = olderThan ? entries.filter((entry) => compareTimes(entry.time, olderThan) < 0) : entries;
++    const logs = remaining.slice(0, 100);
++    return page(logs, remaining.length > 100 ? logs[logs.length - 1].time : '');
++});
++
++describe('recoverLiveLogs baselines and catch-up', () => {
++    it('establishes a baseline once with the entire newest timestamp multiset', async () => {
++        const head = row(3);
++        const other = row(3, { domain: 'other.test' });
++        const fetchPage = scripted(page([row(2), head, head, other], time(2)));
++        const result = await recoverLiveLogs(fetchPage, null);
++        expect(fetchPage).toHaveBeenCalledExactlyOnceWith(undefined);
++        expect(result.checkpoint).toEqual(checkpointFor([head, head, other]));
++        expect(result.checkpoint.keys).toHaveLength(3);
++        expect(result.logs.map((entry) => entry.time)).toEqual([time(3), time(3), time(3), time(2)]);
++        expect(result.gap).toBe(false);
++    });
++
++    it('does not retrospectively drain a full initial page', async () => {
++        const fetchPage = scripted(page(rows(100), time(1)));
++        expect((await recoverLiveLogs(fetchPage, null)).gap).toBe(false);
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('records an empty successful initial baseline without draining its scan cursor', async () => {
++        const fetchPage = scripted(page([], time(100)));
++        expect(await recoverLiveLogs(fetchPage, null)).toEqual({ logs: [], checkpoint: emptyBaseline(), gap: false });
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it.each([0, 20, 99, 100, 250, 500])('recovers %i new rows before UI truncation', async (count) => {
++        const entries = rows(count + 1);
++        const fetchPage = history(entries);
++        const onCatchUp = vi.fn();
++        const result = await recoverLiveLogs(fetchPage, baseline(), { onCatchUp });
++        expect(result.gap).toBe(false);
++        expect(result.logs.map((entry) => entry.time)).toEqual(entries.map((entry) => entry.time));
++        expect(result.logs).toHaveLength(count + 1);
++        expect(new Set(result.logs.map((entry) => entry.liveKey)).size).toBe(count + 1);
++        expect(fetchPage).toHaveBeenCalledTimes(Math.ceil((count + 1) / 100));
++        expect(onCatchUp).toHaveBeenCalledTimes(count >= 100 ? 1 : 0);
++        expect(result.checkpoint).toEqual(checkpointFor(entries.slice(0, 100)));
++    });
++
++    it('bounds 1100 new rows at ten pages and rebases to avoid repeating expensive backfill', async () => {
++        const fetchPage = history(rows(1101));
++        const result = await recoverLiveLogs(fetchPage, baseline());
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('page-budget');
++        expect(result.logs).toHaveLength(LIVE_LOG_RECOVERY_MAX_ROWS);
++        expect(result.logs[0].time).toBe(time(1101));
++        expect(result.logs[999].time).toBe(time(102));
++        expect(fetchPage).toHaveBeenCalledTimes(LIVE_LOG_RECOVERY_MAX_PAGES);
++        expect(result.checkpoint).toEqual(checkpointFor(rows(100, 1001)));
++        fetchPage.mockClear();
++        expect((await recoverLiveLogs(fetchPage, result.checkpoint)).gap).toBe(false);
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('stops on complete first-page overlap while retaining late completed older rows', async () => {
++        const late = row(3, { elapsedMs: '1200' });
++        const fetchPage = scripted(page([late, row(6), row(5)], time(3)));
++        const onCatchUp = vi.fn();
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(5)]), { onCatchUp });
++        expect(result.gap).toBe(false);
++        expect(result.logs.map((entry) => entry.time)).toEqual([time(6), time(5), time(3)]);
++        expect(result.logs[2].elapsedMs).toBe('1200');
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++        expect(onCatchUp).not.toHaveBeenCalled();
++    });
++
++    it('preserves full nanoseconds and sorts pages without mutating them', async () => {
++        const input = [row(102), row(104), row(103)];
++        const fetchPage = scripted(page(input, time(102)), page([row(101), row(100)]));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(100)]));
++        expect(result.logs.map((entry) => entry.time)).toEqual([104, 103, 102, 101, 100].map(time));
++        expect(input.map((entry) => entry.time)).toEqual([102, 104, 103].map(time));
++        expect(fetchPage.mock.calls).toEqual([[undefined], [time(102)]]);
++    });
++});
++
++describe('multiset overlap and ambiguous pagination', () => {
++    it('continues partial overlap until every distinct checkpoint head key is found', async () => {
++        const first = row(5, { domain: 'first.test' });
++        const second = row(5, { domain: 'second.test' });
++        const fetchPage = scripted(page([row(6), first], time(5)), page([second, row(4)]));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([first, second]));
++        expect(result.gap).toBe(false);
++        expect(result.logs).toHaveLength(4);
++        expect(fetchPage).toHaveBeenCalledTimes(2);
++    });
++
++    it('reports partial head loss once the scan passes the checkpoint timestamp', async () => {
++        const first = row(5);
++        const second = row(5, { domain: 'missing.test' });
++        const fetchPage = scripted(page([row(6), first], time(5)), page([row(4)], time(4)));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([first, second]));
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('checkpoint-missing');
++        expect(fetchPage).toHaveBeenCalledTimes(2);
++    });
++
++    it('requires missing occurrence keys rather than accepting one indistinguishable duplicate', async () => {
++        const duplicate = row(5);
++        const fetchPage = scripted(page([row(6), duplicate], time(5)), page([row(4)]));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([duplicate, duplicate]));
++        expect(fetchPage).toHaveBeenCalledTimes(2);
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('ambiguous-frontier');
++    });
++
++    it.each([1, 2])('flags duplicate frontier ambiguity with %i prior occurrences, despite overlap', async (count) => {
++        const duplicate = row(5);
++        const fetchPage = scripted(page([row(6), duplicate, duplicate], time(5)));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor(Array(count).fill(duplicate)));
++        expect(result.logs).toHaveLength(3);
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('ambiguous-frontier');
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('merges overlapping pages with maximum per-page multiplicity instead of summing occurrences', async () => {
++        const duplicate = row(5);
++        const renamed = { ...duplicate, client_info: { name: 'Changed' } };
++        const fetchPage = scripted(
++            page([row(6), duplicate, duplicate], time(5)),
++            page([renamed, renamed, renamed, row(4), row(1)]),
++        );
++        const result = await recoverLiveLogs(fetchPage, baseline());
++        expect(result.gap).toBe(false);
++        expect(result.logs).toHaveLength(6);
++        expect(result.logs.filter((entry) => entry.time === time(5))).toHaveLength(3);
++        expect(new Set(result.logs.map((entry) => entry.liveKey)).size).toBe(6);
++    });
++
++    it.each([false, true])('flags a full-page tied cursor boundary with head overlap=%s', async (overlap) => {
++        const first = row(5, { domain: 'first.test' });
++        const second = row(5, { domain: 'second.test' });
++        const full = [...rows(98, 5), first, second];
++        const fetchPage = scripted(page(full, time(5)), page([row(4), row(1)]));
++        const result = await recoverLiveLogs(fetchPage, overlap ? checkpointFor([first, second]) : baseline());
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('ambiguous-page-boundary');
++        expect(fetchPage).toHaveBeenCalledTimes(overlap ? 1 : 2);
++    });
++
++    it('accepts an explicitly exhausted tied full page with distinct identities', async () => {
++        const first = row(5, { domain: 'first.test' });
++        const second = row(5, { domain: 'second.test' });
++        const fetchPage = scripted(page([...rows(98, 5), first, second]));
++        expect((await recoverLiveLogs(fetchPage, checkpointFor([first, second]))).gap).toBe(false);
++    });
++
++    it('accepts timestamp ties away from the cursor boundary', async () => {
++        const entries = [...rows(97, 5), row(5), row(5, { type: 'AAAA' }), row(1)];
++        expect((await recoverLiveLogs(scripted(page(entries, time(1))), baseline())).gap).toBe(false);
++    });
++});
++
++describe('filtered scans, cursor safety, and checkpoint expiry', () => {
++    it('drains a formerly empty baseline through full and short pages to explicit exhaustion', async () => {
++        const fetchPage = scripted(
++            page(rows(100, 200), time(201)), page(rows(2, 100), time(100)), page([row(50)]),
++        );
++        const result = await recoverLiveLogs(fetchPage, emptyBaseline());
++        expect(result.gap).toBe(false);
++        expect(result.logs).toHaveLength(103);
++        expect(fetchPage).toHaveBeenCalledTimes(3);
++    });
++
++    it('does not assume a short newest page is exhausted for a previously empty baseline', async () => {
++        const fetchPage = scripted(page([row(5)], time(4)), page([row(3)]));
++        const result = await recoverLiveLogs(fetchPage, emptyBaseline());
++        expect(result.logs).toHaveLength(2);
++        expect(result.gap).toBe(false);
++        expect(fetchPage).toHaveBeenCalledTimes(2);
++    });
++
++    it('continues through empty scans and checkpoints the newest recovered group', async () => {
++        const fetchPage = scripted(
++            page([], time(10)), page([], time(8)), page([row(7)], time(5)), page([row(1)]),
++        );
++        const result = await recoverLiveLogs(fetchPage, baseline());
++        expect(result.gap).toBe(false);
++        expect(result.logs.map((entry) => entry.time)).toEqual([time(7), time(1)]);
++        expect(result.checkpoint).toEqual(checkpointFor([row(7)]));
++        expect(fetchPage.mock.calls).toEqual([[undefined], [time(10)], [time(8)], [time(5)]]);
++    });
++
++    it('drains empty progressing scans from an empty baseline', async () => {
++        const fetchPage = scripted(page([], time(10)), page([], time(5)), page([]));
++        expect(await recoverLiveLogs(fetchPage, emptyBaseline())).toEqual({
++            logs: [], checkpoint: emptyBaseline(), gap: false,
++        });
++        expect(fetchPage).toHaveBeenCalledTimes(3);
++    });
++
++    it('detects an empty scan passing the frontier without another request', async () => {
++        const fetchPage = scripted(page([], time(4)));
++        expect((await recoverLiveLogs(fetchPage, checkpointFor([row(5)]))).reason).toBe('checkpoint-missing');
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it.each([false, true])('reports expired checkpoints with older rows=%s', async (older) => {
++        const fetchPage = scripted(older ? page([row(3)], time(3)) : page([]));
++        const result = await recoverLiveLogs(fetchPage, checkpointFor([row(5)]));
++        expect(result.gap).toBe(true);
++        expect(result.reason).toBe('checkpoint-missing');
++        expect(result.checkpoint).toEqual(older ? checkpointFor([row(3)])
++            : { ...checkpointFor([row(5)]), limited: true });
++    });
++
++    it.each([undefined, null, 12, 'garbage', '0', '2026-10-01', '2026-10-01T25:00:00Z'])(
++        'guards missing or malformed cursor %s', async (oldest) => {
++            const fetchPage = scripted({ logs: [row(5)], oldest } as LiveLogPage);
++            const result = await recoverLiveLogs(fetchPage, baseline());
++            expect(result.reason).toBe('invalid-cursor');
++            expect(result.gap).toBe(true);
++            expect(fetchPage).toHaveBeenCalledTimes(1);
++        },
++    );
++
++    it('validates initial baseline cursors', async () => {
++        const result = await recoverLiveLogs(scripted(page([row(5)], 'bad')), null);
++        expect(result.reason).toBe('invalid-cursor');
++        expect(result.checkpoint).toEqual(checkpointFor([row(5)]));
++    });
++
++    it.each([time(5), time(6), '2026-10-01T12:00:00.000000005+00:00'])(
++        'guards repeated or increasing cursor %s', async (oldest) => {
++            const fetchPage = scripted(page([row(10)], time(5)), page([], oldest));
++            const result = await recoverLiveLogs(fetchPage, baseline());
++            expect(result.reason).toBe('nonprogressing-cursor');
++            expect(fetchPage).toHaveBeenCalledTimes(2);
++            expect(result.checkpoint).toEqual(checkpointFor([row(10)]));
++        },
++    );
++});
++
++describe('budgets, partial API failures, and cancellation', () => {
++    it('uses the default monotonic 5000ms budget before another request', async () => {
++        const now = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValue(5000);
++        try {
++            const fetchPage = scripted(page(rows(100, 100), time(101)));
++            const result = await recoverLiveLogs(fetchPage, baseline());
++            expect(result.reason).toBe('time-budget');
++            expect(result.checkpoint).toEqual(checkpointFor(rows(100, 100)));
++            expect(fetchPage).toHaveBeenCalledTimes(1);
++        } finally {
++            now.mockRestore();
++        }
++        expect(LIVE_LOG_RECOVERY_MAX_DURATION_MS).toBe(5000);
++    });
++
++    it('enforces elapsed duration cumulatively across short pages', async () => {
++        let elapsed = 0;
++        const fetchPage = vi.fn(async () => {
++            elapsed += 2000;
++            return page([row(100 - elapsed / 1000)], time(99 - elapsed / 1000));
++        });
++        const result = await recoverLiveLogs(fetchPage, baseline(), { now: () => elapsed });
++        expect(result.reason).toBe('time-budget');
++        expect(fetchPage).toHaveBeenCalledTimes(3);
++        expect(result.logs).toHaveLength(3);
++    });
++
++    it('supports reduced budgets while capping increased options at hard limits', async () => {
++        const limited = history(rows(1000));
++        expect((await recoverLiveLogs(limited, baseline(), { maxPages: 2 })).reason).toBe('page-budget');
++        expect(limited).toHaveBeenCalledTimes(2);
++        const capped = history(rows(2000));
++        await recoverLiveLogs(capped, baseline(), { maxPages: 100 });
++        expect(capped).toHaveBeenCalledTimes(10);
++        let elapsed = 0;
++        const timed = vi.fn(async () => {
++            elapsed += 5000;
++            return page([row(10)], time(10));
++        });
++        const result = await recoverLiveLogs(timed, baseline(), { now: () => elapsed, maxDurationMs: 100000 });
++        expect(result.reason).toBe('time-budget');
++        expect(timed).toHaveBeenCalledTimes(1);
++    });
++
++    it('returns partial rows and preserves the original checkpoint for retry after API failure', async () => {
++        const original = baseline();
++        const snapshot = JSON.stringify(original);
++        const error = new Error('disconnected');
++        const fetchPage = vi.fn().mockResolvedValueOnce(page([row(3)], time(3))).mockRejectedValueOnce(error);
++        const result = await recoverLiveLogs(fetchPage, original);
++        expect(result.error).toBe(error);
++        expect(result.checkpoint).toBe(original);
++        expect(result.gap).toBe(false);
++        expect(result.reason).toBeUndefined();
++        expect(result.logs).toEqual(identifyLiveLogs([row(3)]));
++        expect(JSON.stringify(original)).toBe(snapshot);
++        const retry = await recoverLiveLogs(history(rows(3)), result.checkpoint);
++        expect(retry.gap).toBe(false);
++        expect(retry.logs).toHaveLength(3);
++    });
++
++    it.each([null, baseline()])('preserves the input checkpoint on initial fetch failure (%s)', async (original) => {
++        const error = new Error('offline');
++        const result = await recoverLiveLogs(vi.fn().mockRejectedValue(error), original);
++        expect(result).toEqual({ logs: [], checkpoint: original, gap: false, error });
++    });
++
++    it('does not mutate frozen checkpoint keys or page rows', async () => {
++        const original = baseline();
++        Object.freeze(original.keys);
++        Object.freeze(original);
++        const entries = [Object.freeze(row(3)), Object.freeze(row(1))];
++        Object.freeze(entries);
++        expect((await recoverLiveLogs(scripted(page(entries)), original)).gap).toBe(false);
++        expect(original).toEqual(baseline());
++    });
++
++    it('requests pages sequentially and invokes the catch-up callback only once', async () => {
++        let active = 0;
++        const fetchPage = vi.fn(async (olderThan?: string) => {
++            active += 1;
++            expect(active).toBe(1);
++            await Promise.resolve();
++            active -= 1;
++            return olderThan ? page([row(1)]) : page([row(3)], time(3));
++        });
++        const onCatchUp = vi.fn();
++        expect((await recoverLiveLogs(fetchPage, baseline(), { onCatchUp })).gap).toBe(false);
++        expect(onCatchUp).toHaveBeenCalledTimes(1);
++    });
++
++    it.each(['signal', 'stale'])('rejects before fetching when cancelled via %s', async (kind) => {
++        const controller = new AbortController();
++        if (kind === 'signal') {
++            controller.abort();
++        }
++        const fetchPage = scripted(page([row(2)]));
++        await expect(recoverLiveLogs(fetchPage, baseline(), {
++            signal: controller.signal, isCurrent: () => kind !== 'stale',
++        })).rejects.toMatchObject({ name: 'AbortError' });
++        expect(fetchPage).not.toHaveBeenCalled();
++    });
++
++    it.each(['signal', 'stale'])('rejects after an in-flight fetch is cancelled via %s', async (kind) => {
++        const controller = new AbortController();
++        let current = true;
++        const original = baseline();
++        const fetchPage = vi.fn(async () => {
++            if (kind === 'signal') {
++                controller.abort();
++            } else {
++                current = false;
++            }
++            return page([row(3), row(1)]);
++        });
++        await expect(recoverLiveLogs(fetchPage, original, {
++            signal: controller.signal, isCurrent: () => current,
++        })).rejects.toMatchObject({ name: 'AbortError' });
++        expect(original).toEqual(baseline());
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('checks cancellation after onCatchUp before the next request', async () => {
++        const controller = new AbortController();
++        const fetchPage = scripted(page([row(3)], time(3)));
++        await expect(recoverLiveLogs(fetchPage, baseline(), {
++            signal: controller.signal, onCatchUp: () => controller.abort(),
++        })).rejects.toMatchObject({ name: 'AbortError' });
++        expect(fetchPage).toHaveBeenCalledTimes(1);
++    });
++
++    it('rejects independently aborted fetches', async () => {
++        const error = new DOMException('Request deadline', 'AbortError');
++        await expect(recoverLiveLogs(vi.fn().mockRejectedValue(error), baseline()))
++            .rejects.toMatchObject({ name: 'AbortError' });
++    });
++    it('rebases an empty first page onto recovered rows and avoids repeating the page budget', async () => {
++        const initial = scripted(page([], time(50)), page([row(40)], time(40)));
++        const result = await recoverLiveLogs(initial, baseline(), { maxPages: 2 });
++        expect(result.reason).toBe('page-budget');
++        expect(result.checkpoint).toEqual(checkpointFor([row(40)]));
++        const again = scripted(page([], time(50)), page([row(40)], time(40)));
++        const next = await recoverLiveLogs(again, result.checkpoint);
++        expect(next.gap).toBe(false);
++        expect(again).toHaveBeenCalledTimes(2);
++    });
++
++    it('probes only the head after an all-empty scan exhausts its budget', async () => {
++        const initial = scripted(page([], time(50)), page([], time(40)));
++        const result = await recoverLiveLogs(initial, baseline(), { maxPages: 2 });
++        expect(result.checkpoint).toEqual({ ...baseline(), limited: true });
++        const again = scripted(page([], time(50)));
++        const next = await recoverLiveLogs(again, result.checkpoint);
++        expect(again).toHaveBeenCalledTimes(1);
++        expect(next.gap).toBe(true);
++        expect(next.checkpoint).toEqual(result.checkpoint);
++        const fresh = await recoverLiveLogs(scripted(page([row(60)], time(50))), next.checkpoint);
++        expect(fresh.checkpoint).toEqual(checkpointFor([row(60)]));
++        expect(fresh.gap).toBe(true);
++    });
++
++});
 diff --git a/client/src/__tests__/queryLogsRequests.test.ts b/client/src/__tests__/queryLogsRequests.test.ts
 new file mode 100644
-index 0000000..88922aa
+index 0000000..91cbda5
 --- /dev/null
 +++ b/client/src/__tests__/queryLogsRequests.test.ts
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,159 @@
 +import { beforeEach, describe, expect, it, vi } from 'vitest';
 +import { applyMiddleware, combineReducers, createStore } from 'redux';
 +import thunk from 'redux-thunk';
@@ -237,8 +679,8 @@ index 0000000..88922aa
 +import access from '../reducers/access';
 +import { toggleClientBlock } from '../actions/access';
 +import {
-+    getLogs, getLogsRequest, getLogsSuccess, receiveLiveLogs, resetLogsView,
-+    revealPendingLogs, setFilteredLogs, setLiveLogsEnabled, updateLogs,
++    clearLiveLogsView, getLogs, getLogsRequest, getLogsSuccess, receiveLiveLogs, resetLogsView,
++    revealPendingLogs, setFilteredLogs, setFilteredLogsSuccess, setLiveLogsEnabled, updateLogs,
 +} from '../actions/queryLogs';
 +import { normalizeLogs } from '../helpers/helpers';
 +
@@ -369,6 +811,23 @@ index 0000000..88922aa
 +        expect(store.getState().logs.map((row: any) => row.time)).toEqual([rawRow(2).time, rawRow(1).time]);
 +        expect(store.getState().oldest).toBe(rawRow(1).time);
 +    });
++    it('resets populated Live state and filter boundaries when leaving the page', () => {
++        const { store, dispatch } = makeStore();
++        dispatch(setLiveLogsEnabled(true));
++        dispatch(setFilteredLogsSuccess({
++            logs: normalizeLogs([rawRow(1)]), oldest: rawRow(1).time,
++            filter: { search: 'google.com', response_status: 'blocked' },
++        }));
++        dispatch(clearLiveLogsView({ through: rawRow(1).time }));
++        dispatch(receiveLiveLogs({ logs: normalizeLogs([rawRow(2)]), atTop: false }));
++        expect(store.getState().livePending).toHaveLength(1);
++        dispatch(resetLogsView());
++        expect(store.getState()).toMatchObject({
++            logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '',
++            liveEnabled: false, filter: { search: '', response_status: 'all' }, processingGetLogs: false,
++        });
++    });
++
 +});
 diff --git a/client/src/__tests__/statsRange.test.ts b/client/src/__tests__/statsRange.test.ts
 new file mode 100644
@@ -413,22 +872,24 @@ index 0000000..61a1fbe
 +});
 diff --git a/client/src/__tests__/useLiveQueryLog.test.tsx b/client/src/__tests__/useLiveQueryLog.test.tsx
 new file mode 100644
-index 0000000..b5f7405
+index 0000000..1174e3b
 --- /dev/null
 +++ b/client/src/__tests__/useLiveQueryLog.test.tsx
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,676 @@
 +import React, { useRef } from 'react';
 +import ReactDOM from 'react-dom';
 +import { act } from 'react-dom/test-utils';
 +import { Provider } from 'react-redux';
-+import { combineReducers, createStore } from 'redux';
++import { applyMiddleware, combineReducers, createStore } from 'redux';
++import thunk from 'redux-thunk';
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +
 +import apiClient from '../api/Api';
-+import { getLogsRequest, getLogsSuccess, setLogsFilter, updateLogs } from '../actions/queryLogs';
++import { getLogsRequest, getLogsSuccess, refreshFilteredLogs, setFilteredLogs, setLogsFilter, updateLogs } from '../actions/queryLogs';
 +import queryLogs from '../reducers/queryLogs';
 +import { useLiveQueryLog } from '../components/Logs/useLiveQueryLog';
 +import { LIVE_LOG_STORAGE_KEY } from '../helpers/liveQueryLog';
++import { normalizeLogs } from '../helpers/helpers';
 +
 +vi.mock('../api/Api', () => ({ default: { getQueryLog: vi.fn(), clearQueryLog: vi.fn() } }));
 +
@@ -444,6 +905,7 @@ index 0000000..b5f7405
 +    let store: any;
 +    let controls: ReturnType<typeof useLiveQueryLog>;
 +    let tableTop: number;
++    const onlineDescriptor = Object.getOwnPropertyDescriptor(navigator, 'onLine');
 +    const visibleDescriptor = Object.getOwnPropertyDescriptor(document, 'visibilityState');
 +
 +    const Harness = () => {
@@ -471,6 +933,7 @@ index 0000000..b5f7405
 +        vi.useFakeTimers();
 +        vi.mocked(apiClient.getQueryLog).mockReset().mockResolvedValue(response(1));
 +        localStorage.clear();
++        Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
 +        tableTop = 0;
 +        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
 +        container = document.createElement('div');
@@ -482,7 +945,7 @@ index 0000000..b5f7405
 +        store = createStore(reducer, {
 +            ...reducer(undefined, { type: '@@init', payload: undefined }),
 +            queryLogs: { ...queryLogs(undefined, { type: '@@init', payload: undefined }), processingGetLogs: false },
-+        });
++        }, applyMiddleware(thunk));
 +    });
 +
 +    afterEach(() => {
@@ -491,6 +954,8 @@ index 0000000..b5f7405
 +        expect(apiClient.clearQueryLog).not.toHaveBeenCalled();
 +        vi.restoreAllMocks();
 +        vi.useRealTimers();
++        if (onlineDescriptor) Object.defineProperty(navigator, 'onLine', onlineDescriptor);
++        else delete (navigator as any).onLine;
 +        if (visibleDescriptor) {
 +            Object.defineProperty(document, 'visibilityState', visibleDescriptor);
 +        } else {
@@ -682,21 +1147,428 @@ index 0000000..b5f7405
 +        await tick();
 +        expect(store.getState().queryLogs.logs).toHaveLength(1);
 +    });
++    const dataset = (count: number, offset = 0) => Array.from({ length: count }, (_, i) => rawRow(count + offset - i));
++    const serve = (records: any[]) => {
++        vi.mocked(apiClient.getQueryLog).mockImplementation(async (params) => {
++            const data = records.filter((row) => !params.older_than || row.time < params.older_than)
++                .sort((a, b) => b.time.localeCompare(a.time)).slice(0, params.limit);
++            return { data, oldest: data[data.length - 1]?.time || '' };
++        });
++    };
++    const connection = (online: boolean) => {
++        Object.defineProperty(navigator, 'onLine', { configurable: true, value: online });
++        act(() => { window.dispatchEvent(new Event(online ? 'online' : 'offline')); });
++    };
++
++    it.each([1, 99, 100, 250, 500])('recovers %i arrivals using only advancing timestamp cursors', async (count) => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        expect(controls.status).toBe('synced');
++        vi.mocked(apiClient.getQueryLog).mockClear();
++        records.unshift(...dataset(count, 1));
++        await tick();
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(Math.floor(count / 100) + 1);
++        const {calls} = vi.mocked(apiClient.getQueryLog).mock;
++        expect(calls[0][0]).not.toHaveProperty('older_than');
++        calls.forEach(([params], index) => {
++            expect(params).not.toHaveProperty('offset');
++            expect(params.limit).toBe(100);
++            if (index) expect(params.older_than).toBe(rawRow(count + 2 - index * 100).time);
++        });
++        const {logs} = store.getState().queryLogs;
++        expect(logs).toHaveLength(Math.min(500, count + 1));
++        expect(new Set(logs.map((row: any) => row.liveKey)).size).toBe(logs.length);
++        expect(logs.map((row: any) => row.time)).toEqual(dataset(count + 1).slice(0, 500).map((row) => row.time));
++        expect(controls.status).toBe('synced');
++    });
++
++    it('bounds a >1000 burst, retains a gap after success, and avoids retrying old backfill', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(1100, 1));
++        vi.mocked(apiClient.getQueryLog).mockClear();
++        await tick();
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(10);
++        expect(controls.status).toBe('gap');
++        expect(controls.hasGap).toBe(true);
++        expect(store.getState().queryLogs.logs).toHaveLength(500);
++        await tick();
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(11);
++        expect(controls.status).toBe('gap');
++        act(() => controls.toggleLive());
++        expect(controls.status).toBe('paused');
++        expect(controls.hasGap).toBe(true);
++        act(() => controls.toggleLive());
++        await tick();
++        expect(controls.status).toBe('gap');
++        act(() => { store.dispatch(setLogsFilter({ search: 'new', response_status: 'all' })); });
++        await tick();
++        expect(controls.hasGap).toBe(false);
++        expect(controls.status).toBe('synced');
++    });
++
++    it.each(['pause', 'hidden', 'offline'])('recovers a burst after %s while preserving its checkpoint', async (kind) => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        if (kind === 'pause') act(() => controls.toggleLive());
++        else if (kind === 'hidden') visibility('hidden');
++        else connection(false);
++        records.unshift(...dataset(250, 1));
++        await tick(10000);
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(1);
++        if (kind === 'pause') act(() => controls.toggleLive());
++        else if (kind === 'hidden') visibility('visible');
++        else connection(true);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(251);
++        expect(controls.hasGap).toBe(false);
++        expect(controls.status).toBe('synced');
++    });
++
++    it('preserves the checkpoint and partial arrivals after a later page fails, then fully recovers', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        act(() => controls.clearView());
++        records.unshift(...dataset(250, 1));
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: rawRow(152).time })
++            .mockRejectedValueOnce(new Error('second page failed'));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(100);
++        expect(controls.status).toBe('reconnecting');
++        expect(controls.hasGap).toBe(false);
++        await tick(5000);
++        expect(store.getState().queryLogs.logs).toHaveLength(250);
++        expect(controls.status).toBe('synced');
++        expect(store.getState().errors).toHaveLength(1);
++    });
++
++    it('ignores an obsolete filter response part-way through catch-up', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250, 1));
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: rawRow(152).time })
++            .mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        await tick();
++        expect(controls.status).toBe('catching_up');
++        act(() => { store.dispatch(setLogsFilter({ search: 'other', response_status: 'all' })); });
++        const before = store.getState().queryLogs.logs;
++        await act(async () => resolve(response(800)));
++        expect(store.getState().queryLogs.logs).toBe(before);
++        expect(controls.hasGap).toBe(false);
++    });
++
++    it('reports expired history as a persistent gap instead of accepting HTTP success as continuity', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.splice(0, records.length, rawRow(200));
++        await tick();
++        expect(controls.status).toBe('gap');
++        await tick();
++        expect(controls.status).toBe('gap');
++        expect(store.getState().errors).toHaveLength(0);
++    });
++
++    it('preserves a checkpoint across row trimming while the reader stays on old rows', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        tableTop = -400;
++        act(() => { window.dispatchEvent(new Event('scroll')); });
++        for (let index = 0; index < 8; index += 1) {
++            records.unshift(...dataset(100, 1 + index * 100));
++            // Sequential traffic cycles exercise trimming across independent checkpoints.
++            // eslint-disable-next-line no-await-in-loop
++            await tick();
++        }
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++        expect(store.getState().queryLogs.livePending).toHaveLength(500);
++        expect(controls.status).toBe('synced');
++    });
++
++    it('Clear view invalidates in-flight catch-up and never reintroduces records at its timestamp boundary', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        await tick();
++        act(() => controls.clearView());
++        await act(async () => resolve(response(2, 1)));
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift({ ...rawRow(1), client: '192.0.2.20' });
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(2));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++    });
++
++    it('does not advance the checkpoint on malformed data or flood toasts after lifecycle interruptions', async () => {
++        mount();
++        await tick();
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue({ data: [{ time: 'invalid' }], oldest: '' });
++        await tick();
++        expect(controls.status).toBe('reconnecting');
++        visibility('hidden');
++        visibility('visible');
++        await tick(0);
++        expect(store.getState().errors).toHaveLength(1);
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue(response(2, 1));
++        await tick(5000);
++        expect(store.getState().queryLogs.logs).toHaveLength(2);
++        expect(controls.status).toBe('synced');
++    });
++
++    it('aborts a stalled request at the elapsed deadline and recovers without overlap', async () => {
++        mount();
++        await tick();
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce((_params, signal) => new Promise((_resolve, reject) => {
++            signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
++        }));
++        await tick();
++        await tick(4999);
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(2);
++        await tick(1);
++        expect(controls.status).toBe('reconnecting');
++        expect(controls.hasGap).toBe(false);
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue(response(2, 1));
++        await tick(5000);
++        expect(controls.status).toBe('synced');
++        expect(store.getState().queryLogs.logs).toHaveLength(2);
++    });
++
++    it('rebases a timed-out partial backfill with a sticky gap instead of restarting it', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250, 1));
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: rawRow(152).time })
++            .mockImplementationOnce((_params, signal) => new Promise((_resolve, reject) => {
++                signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
++            }));
++        await tick();
++        expect(controls.status).toBe('catching_up');
++        await tick(5000);
++        expect(controls.hasGap).toBe(true);
++        expect(store.getState().queryLogs.logs).toHaveLength(101);
++        const calls = vi.mocked(apiClient.getQueryLog).mock.calls.length;
++        await tick();
++        expect(apiClient.getQueryLog).toHaveBeenCalledTimes(calls + 1);
++        expect(controls.status).toBe('gap');
++    });
++
++    it('uses an empty baseline if Clear view precedes the first Live response', async () => {
++        const records = dataset(200);
++        serve(records);
++        mount();
++        act(() => controls.clearView());
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(201));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++    });
++
++    it('ignores a first page that resolves successfully after its deadline', async () => {
++        mount();
++        await tick();
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        await tick();
++        await tick(5000);
++        await act(async () => resolve(response(2, 1)));
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++        expect(controls.status).toBe('reconnecting');
++        expect(controls.hasGap).toBe(false);
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue(response(3, 2, 1));
++        await tick(5000);
++        expect(store.getState().queryLogs.logs).toHaveLength(3);
++        expect(controls.status).toBe('synced');
++    });
++
++    it('uses the newest recovered timestamp for Clear after an empty filtered first page', async () => {
++        mount();
++        await tick();
++        vi.mocked(apiClient.getQueryLog).mockResolvedValueOnce({ data: [], oldest: rawRow(30).time })
++            .mockResolvedValueOnce(response(29, 1));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(2);
++        act(() => controls.clearView());
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue({
++            data: [rawRow(29), { ...rawRow(29), client: '192.0.2.20' }, rawRow(1)], oldest: '',
++        });
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(controls.status).toBe('synced');
++    });
++
++    it('reports an unusable cursor as a sticky gap distinct from a network error', async () => {
++        mount();
++        await tick();
++        vi.mocked(apiClient.getQueryLog).mockResolvedValueOnce({ data: [rawRow(2), rawRow(1)] });
++        await tick();
++        expect(controls.status).toBe('gap');
++        expect(store.getState().errors).toHaveLength(0);
++        vi.mocked(apiClient.getQueryLog).mockResolvedValue(response(2, 1));
++        await tick();
++        expect(controls.status).toBe('gap');
++    });
++
++    it('recovers every arrival after a partial failure following an empty baseline', async () => {
++        const records = dataset(0);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250));
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: records[99].time })
++            .mockRejectedValueOnce(new Error('Unavailable'));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(100);
++        expect(controls.status).toBe('reconnecting');
++        await tick(5000);
++        expect(store.getState().queryLogs.logs.map((row: any) => row.time)).toEqual(records.map((row) => row.time));
++        expect(controls.status).toBe('synced');
++        expect(controls.hasGap).toBe(false);
++    });
++
++    it('retains the old checkpoint when a visibility-aborted page settles after its deadline', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        records.unshift(...dataset(250, 1));
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog)
++            .mockResolvedValueOnce({ data: records.slice(0, 100), oldest: records[99].time })
++            .mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        await tick();
++        visibility('hidden');
++        visibility('visible');
++        await tick(6000);
++        await act(async () => resolve({ data: records.slice(100, 200), oldest: records[199].time }));
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++        expect(controls.hasGap).toBe(false);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(251);
++        expect(controls.status).toBe('synced');
++        expect(controls.hasGap).toBe(false);
++    });
++
++    it('Clear view cancels a pending same-filter refresh and suppresses its late response', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        let resolve: (value: any) => void;
++        vi.mocked(apiClient.getQueryLog).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
++        let refresh: Promise<void>;
++        act(() => { refresh = store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.processingGetLogs).toBe(true);
++        const signal = vi.mocked(apiClient.getQueryLog).mock.calls[1][1];
++        act(() => controls.clearView());
++        expect(signal.aborted).toBe(true);
++        await act(async () => { resolve(response(1)); await refresh; });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        expect(store.getState().queryLogs.processingGetLogs).toBe(false);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(2));
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(1);
++    });
++
++    it('retains Clear view through a later same-filter refresh and resets it for a new filter', async () => {
++        const records = dataset(1);
++        serve(records);
++        mount();
++        await tick();
++        act(() => controls.clearView());
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        records.unshift(rawRow(2));
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs.map((row: any) => row.time)).toEqual([rawRow(2).time]);
++        await act(async () => {
++            await store.dispatch(setFilteredLogs({ search: 'new.example', response_status: 'all' }));
++        });
++        expect(store.getState().queryLogs.liveClearedThrough).toBe('');
++        expect(store.getState().queryLogs.logs).toHaveLength(2);
++    });
++
++    it('keeps the maximum clear boundary through repeated clears before the first Live poll', async () => {
++        store.dispatch(getLogsSuccess({ logs: normalizeLogs([rawRow(1)]), oldest: '', older_than: '' }));
++        mount();
++        act(() => controls.clearView());
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        act(() => controls.clearView());
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++    });
++
++    it('retains the active filter clear boundary if a direct filter request fails', async () => {
++        mount();
++        await tick();
++        act(() => controls.clearView());
++        await act(async () => { await store.dispatch(refreshFilteredLogs()); });
++        const { filter } = store.getState().queryLogs;
++        vi.mocked(apiClient.getQueryLog).mockRejectedValueOnce(new Error('Unavailable'));
++        await act(async () => {
++            await store.dispatch(setFilteredLogs({ search: 'new.example', response_status: 'all' }));
++        });
++        expect(store.getState().queryLogs.filter).toEqual(filter);
++        expect(store.getState().queryLogs.liveClearedThrough).toBe(rawRow(1).time);
++        await tick();
++        expect(store.getState().queryLogs.logs).toHaveLength(0);
++    });
++
 +});
 diff --git a/client/src/actions/queryLogs.ts b/client/src/actions/queryLogs.ts
-index 70dc568..1711924 100644
+index 70dc568..cf8debe 100644
 --- a/client/src/actions/queryLogs.ts
 +++ b/client/src/actions/queryLogs.ts
-@@ -7,12 +7,21 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
+@@ -7,12 +7,24 @@ import { DEFAULT_LOGS_FILTER, QUERY_LOGS_PAGE_LIMIT } from '../helpers/constants
  import { addErrorToast, addSuccessToast } from './toasts';
  import { SearchFormValues } from '../components/Logs';
  
 -const getLogsWithParams = async (config: any) => {
 +let logsRequest: AbortController;
 +let logsGeneration = 0;
-+const startLogsRequest = () => {
++export const cancelLogsRequest = () => {
 +    logsRequest?.abort();
 +    logsGeneration += 1;
++};
++const startLogsRequest = () => {
++    cancelLogsRequest();
 +    logsRequest = new AbortController();
 +    return { signal: logsRequest.signal, generation: logsGeneration };
 +};
@@ -711,7 +1583,7 @@ index 70dc568..1711924 100644
      const { data, oldest } = rawLogs;
  
      return {
-@@ -28,9 +37,14 @@ export const getAdditionalLogsRequest = createAction('GET_ADDITIONAL_LOGS_REQUES
+@@ -28,9 +40,14 @@ export const getAdditionalLogsRequest = createAction('GET_ADDITIONAL_LOGS_REQUES
  export const getAdditionalLogsFailure = createAction('GET_ADDITIONAL_LOGS_FAILURE');
  export const getAdditionalLogsSuccess = createAction('GET_ADDITIONAL_LOGS_SUCCESS');
  
@@ -727,7 +1599,7 @@ index 70dc568..1711924 100644
  
      const previousQuery = filter?.search;
      const isQueryTheSame =
-@@ -48,18 +62,23 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
+@@ -48,18 +65,23 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
              const additionalLogs = await getLogsWithParams({
                  older_than: oldest,
                  filter,
@@ -756,7 +1628,7 @@ index 70dc568..1711924 100644
          }
      }
  
-@@ -67,49 +86,45 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
+@@ -67,49 +89,44 @@ const shortPollQueryLogs = async (data: any, filter: any, dispatch: any, current
      return totalData;
  };
  
@@ -764,10 +1636,9 @@ index 70dc568..1711924 100644
 +export const receiveLiveLogs = createAction('RECEIVE_LIVE_LOGS');
 +export const revealPendingLogs = createAction('REVEAL_PENDING_LOGS');
 +export const clearLiveLogsView = createAction('CLEAR_LIVE_LOGS_VIEW');
-+const resetLogsViewRequest = createAction('RESET_LOGS_VIEW');
++export const resetLogsViewRequest = createAction('RESET_LOGS_VIEW');
 +export const resetLogsView = () => {
-+    logsRequest?.abort();
-+    logsGeneration += 1;
++    cancelLogsRequest();
 +    return resetLogsViewRequest();
 +};
 +
@@ -833,7 +1704,7 @@ index 70dc568..1711924 100644
      }
  };
  
-@@ -129,27 +144,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
+@@ -129,27 +146,19 @@ export const setFilteredLogsFailure = createAction('SET_FILTERED_LOGS_FAILURE');
  export const setFilteredLogsSuccess = createAction('SET_FILTERED_LOGS_SUCCESS');
  
  export const setFilteredLogs = (filter?: SearchFormValues) => async (dispatch: any) => {
@@ -1423,10 +2294,10 @@ index e148364..daedf03 100644
                              {t('loading_table_status')}
                          </div>
 diff --git a/client/src/components/Logs/Logs.css b/client/src/components/Logs/Logs.css
-index 4203615..1d4d918 100644
+index 4203615..cd700e9 100644
 --- a/client/src/components/Logs/Logs.css
 +++ b/client/src/components/Logs/Logs.css
-@@ -541,3 +541,33 @@
+@@ -541,3 +541,49 @@
  [data-theme='dark'] .button-action__icon {
      color: var(--gray-f3);
  }
@@ -1460,8 +2331,24 @@ index 4203615..1d4d918 100644
 +    /* Above the upstream footer (102), below menus and toasts. */
 +    z-index: 105;
 +}
++
++.logs__sync-status {
++    display: flex;
++    align-items: center;
++    flex-wrap: wrap;
++    gap: 0.5rem;
++    font-size: 0.875rem;
++    color: var(--logs__text-color);
++}
++
++.logs__sync-status--gap {
++    padding: 0.25rem 0.5rem;
++    border: 1px solid currentColor;
++    border-radius: 4px;
++    background-color: var(--yellow);
++}
 diff --git a/client/src/components/Logs/index.tsx b/client/src/components/Logs/index.tsx
-index 8f9013b..fd39ca0 100644
+index 8f9013b..b2bf4f9 100644
 --- a/client/src/components/Logs/index.tsx
 +++ b/client/src/components/Logs/index.tsx
 @@ -1,5 +1,5 @@
@@ -1491,7 +2378,7 @@ index 8f9013b..fd39ca0 100644
 +    ensureLiveLogStrings();
 +    const { t } = useTranslation();
 +    const tableRef = useRef<HTMLDivElement>(null);
-+    const { live, toggleLive, clearView, showNewest, pendingCount } = useLiveQueryLog(tableRef);
++    const { live, toggleLive, clearView, showNewest, pendingCount, status, hasGap } = useLiveQueryLog(tableRef);
      const dispatch = useDispatch();
      const history = useHistory();
  
@@ -1579,7 +2466,7 @@ index 8f9013b..fd39ca0 100644
      const renderPage = () => (
          <>
              <FormProvider {...formMethods}>
-@@ -197,7 +200,35 @@ const Logs = () => {
+@@ -197,7 +200,40 @@ const Logs = () => {
                  />
              </FormProvider>
  
@@ -1597,6 +2484,11 @@ index 8f9013b..fd39ca0 100644
 +                        {t('live_log_clear')}
 +                    </button>
 +                )}
++                <span className={`logs__sync-status${hasGap ? ' logs__sync-status--gap' : ''}`}
++                    role="status" aria-live="polite" aria-atomic="true" title={t('live_log_status_hint')}>
++                    {status !== 'gap' && <span>{t(`live_log_${status}`)}</span>}
++                    {hasGap && <span>{t('live_log_gap')}</span>}
++                </span>
 +                {live && <span id="live-log-clear-hint" className="sr-only">{t('live_log_clear_hint')}</span>}
 +            </div>
 +            {pendingCount > 0 && (
@@ -1617,21 +2509,26 @@ index 8f9013b..fd39ca0 100644
                  isSmallScreen={isSmallScreen}
 diff --git a/client/src/components/Logs/useLiveQueryLog.ts b/client/src/components/Logs/useLiveQueryLog.ts
 new file mode 100644
-index 0000000..ce0b68d
+index 0000000..53ce8ff
 --- /dev/null
 +++ b/client/src/components/Logs/useLiveQueryLog.ts
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,255 @@
 +import { RefObject, useCallback, useEffect, useRef, useState } from 'react';
 +import { shallowEqual, useDispatch, useSelector } from 'react-redux';
 +
 +import apiClient from '../../api/Api';
 +import { addErrorToast } from '../../actions/toasts';
-+import { clearLiveLogsView, receiveLiveLogs, revealPendingLogs, setLiveLogsEnabled } from '../../actions/queryLogs';
++import {
++    cancelLogsRequest, clearLiveLogsView, receiveLiveLogs, revealPendingLogs, setLiveLogsEnabled,
++} from '../../actions/queryLogs';
 +import { normalizeLogs } from '../../helpers/helpers';
 +import {
 +    LIVE_LOG_INTERVAL_MS, LIVE_LOG_PAGE_SIZE, LIVE_LOG_RETRY_MS,
-+    loadLiveLogPreference, saveLiveLogPreference,
++    loadLiveLogPreference, saveLiveLogPreference, compareTimes, identifyLiveLogs,
 +} from '../../helpers/liveQueryLog';
++import {
++    recoverLiveLogs, checkpointFor, LiveLogCheckpoint, LIVE_LOG_RECOVERY_MAX_DURATION_MS,
++} from '../../helpers/liveQueryLogRecovery';
 +import { RootState } from '../../initialState';
 +
 +export const useLiveQueryLog = (table: RefObject<HTMLDivElement>) => {
@@ -1641,6 +2538,17 @@ index 0000000..ce0b68d
 +    );
 +    const [live, setLive] = useState(loadLiveLogPreference);
 +    const busy = useRef(false);
++    const checkpoint = useRef<LiveLogCheckpoint>(null);
++    const checkpointFilter = useRef(filter ? JSON.stringify(filter) : '{}');
++    const gap = useRef(false);
++    const failed = useRef(false);
++    const abort = useRef<AbortController>();
++    const clearGeneration = useRef(0);
++    const baselineOnly = useRef(false);
++    const observedHead = useRef('');
++    const [clearRevision, setClearRevision] = useState(0);
++    const [phase, setPhase] = useState('catching_up');
++    const [hasGap, setHasGap] = useState(false);
 +    const atTop = useRef(true);
 +    const filterKey = JSON.stringify(filter || {});
 +    const active = useRef(false);
@@ -1674,18 +2582,30 @@ index 0000000..ce0b68d
 +    }, [live, enabled, processingGetConfig, table]);
 +
 +    useEffect(() => {
++        if (checkpointFilter.current !== filterKey) {
++            checkpointFilter.current = filterKey;
++            checkpoint.current = null;
++            observedHead.current = '';
++            gap.current = false;
++            baselineOnly.current = false;
++            setHasGap(false);
++            setPhase('catching_up');
++        }
 +        if (!live || !enabled || processingGetConfig || processingGetLogs) {
 +            return undefined;
 +        }
 +        let stopped = false;
 +        let timer: ReturnType<typeof setTimeout>;
 +        let controller: AbortController;
-+        let failed = false;
++        let cancelForAvailability: () => void;
++        const generation = clearGeneration.current;
 +        const currentFilter = JSON.parse(filterKey);
-+        const current = () => !stopped && active.current && latestFilter.current === filterKey;
++        const current = () => !stopped && active.current && latestFilter.current === filterKey
++            && generation === clearGeneration.current;
 +        const visible = () => document.visibilityState !== 'hidden';
++        const available = () => visible() && navigator.onLine !== false;
 +        async function poll() {
-+            if (!current() || !visible()) {
++            if (!current() || !available()) {
 +                return;
 +            }
 +            if (busy.current) {
@@ -1694,49 +2614,128 @@ index 0000000..ce0b68d
 +            }
 +            busy.current = true;
 +            controller = new AbortController();
++            abort.current = controller;
++            let timedOut = false;
++            let interrupted = false;
++            let newestPage: any[];
++            const processed = new Map<string, any>();
++            const fromTime = checkpoint.current?.time;
++            // The elapsed budget includes transport time, even for a stalled first page.
++            const deadline = setTimeout(() => {
++                timedOut = true;
++                controller.abort();
++            }, LIVE_LOG_RECOVERY_MAX_DURATION_MS);
++            cancelForAvailability = () => {
++                interrupted = true;
++                clearTimeout(deadline);
++                controller.abort();
++            };
 +            try {
-+                const response = await apiClient.getQueryLog(
-+                    { ...currentFilter, limit: LIVE_LOG_PAGE_SIZE }, controller.signal,
-+                );
-+                if (current() && !controller.signal.aborted && visible()) {
-+                    dispatch(receiveLiveLogs({ logs: normalizeLogs(response.data), atTop: atTop.current }));
-+                    failed = false;
++                const result = await recoverLiveLogs(async (olderThan?: string) => {
++                    const response = await apiClient.getQueryLog({
++                        ...currentFilter, limit: LIVE_LOG_PAGE_SIZE,
++                        ...(olderThan ? { older_than: olderThan } : {}),
++                    }, controller.signal);
++                    if (!current() || controller.signal.aborted || !available()) {
++                        throw new DOMException('Live log request cancelled', 'AbortError');
++                    }
++                    // Validate before normalizing: malformed responses must not advance a checkpoint.
++                    if (!response || !Array.isArray(response.data) || response.data.length > LIVE_LOG_PAGE_SIZE
++                        || response.data.some((row: any) => !row || !Number.isFinite(Date.parse(row.time))
++                            || typeof row.time !== 'string' || !row.question
++                            || typeof row.question.name !== 'string' || typeof row.question.type !== 'string')) {
++                        throw new Error('Invalid Query Log response');
++                    }
++                    const logs = normalizeLogs(response.data)
++                        .sort((left: any, right: any) => compareTimes(right.time, left.time));
++                    if (!olderThan) newestPage = logs;
++                    if (logs[0] && (!observedHead.current || compareTimes(logs[0].time, observedHead.current) > 0)) {
++                        observedHead.current = logs[0].time;
++                    }
++                    identifyLiveLogs(logs).forEach((row) => processed.set(row.liveKey, row));
++                    return { logs, oldest: response.oldest };
++                }, checkpoint.current, {
++                    signal: controller.signal,
++                    onCatchUp: () => { if (current()) setPhase('catching_up'); },
++                });
++                if (current() && !controller.signal.aborted && available()) {
++                    if (baselineOnly.current && newestPage) {
++                        dispatch(clearLiveLogsView({ through: observedHead.current }));
++                        baselineOnly.current = false;
++                    } else {
++                        dispatch(receiveLiveLogs({ logs: result.logs, atTop: atTop.current, fromTime }));
++                    }
++                    checkpoint.current = result.checkpoint;
++                    gap.current = gap.current || result.gap;
++                    setHasGap(gap.current);
++                    if (result.error) throw result.error;
++                    failed.current = false;
++                    setPhase('synced');
 +                }
 +            } catch (error) {
-+                if (current() && !controller.signal.aborted) {
-+                    // One toast per outage; retry slowly until a successful poll recovers.
-+                    if (!failed) {
-+                        dispatch(addErrorToast({ error }));
++                if (current() && available() && !interrupted && (timedOut || !controller.signal.aborted)) {
++                    if (timedOut && newestPage) {
++                        // Accept a new boundary only with a persistent gap warning, so a slow
++                        // backfill is not restarted on every retry. Keep successfully read rows.
++                        const logs = [...processed.values()]
++                            .sort((left, right) => compareTimes(right.time, left.time));
++                        const head = checkpointFor(logs);
++                        checkpoint.current = head.time ? head : { ...checkpoint.current, limited: true };
++                        gap.current = true;
++                        setHasGap(true);
++                        if (baselineOnly.current) {
++                            dispatch(clearLiveLogsView({ through: observedHead.current }));
++                            baselineOnly.current = false;
++                        } else {
++                            dispatch(receiveLiveLogs({ logs, atTop: atTop.current, fromTime }));
++                        }
++                        failed.current = false;
++                        setPhase('synced');
++                        return;
 +                    }
-+                    failed = true;
++                    // One toast per outage, including across pause/visibility lifecycle changes.
++                    if (!failed.current) dispatch(addErrorToast({ error }));
++                    failed.current = true;
++                    setPhase('reconnecting');
 +                }
 +            } finally {
++                clearTimeout(deadline);
++                cancelForAvailability = undefined;
 +                busy.current = false;
 +                clearTimeout(timer);
-+                if (current() && visible()) {
-+                    timer = setTimeout(poll, failed ? LIVE_LOG_RETRY_MS : LIVE_LOG_INTERVAL_MS);
++                if (current() && available()) {
++                    timer = setTimeout(poll, failed.current ? LIVE_LOG_RETRY_MS : LIVE_LOG_INTERVAL_MS);
 +                }
 +            }
 +        }
-+        const onVisibility = () => {
++        const onAvailability = () => {
 +            clearTimeout(timer);
-+            if (current() && visible()) {
++            if (current() && available()) {
++                setPhase('catching_up');
 +                timer = setTimeout(poll, 0);
 +            } else {
-+                controller?.abort();
++                cancelForAvailability?.();
++                if (current()) setPhase(visible() ? 'reconnecting' : 'suspended');
 +            }
 +        };
-+        document.addEventListener('visibilitychange', onVisibility);
-+        if (visible()) {
++        document.addEventListener('visibilitychange', onAvailability);
++        window.addEventListener('online', onAvailability);
++        window.addEventListener('offline', onAvailability);
++        if (available()) {
++            setPhase('catching_up');
 +            timer = setTimeout(poll, LIVE_LOG_INTERVAL_MS);
++        } else {
++            setPhase(visible() ? 'reconnecting' : 'suspended');
 +        }
 +        return () => {
 +            stopped = true;
 +            clearTimeout(timer);
 +            controller?.abort();
-+            document.removeEventListener('visibilitychange', onVisibility);
++            document.removeEventListener('visibilitychange', onAvailability);
++            window.removeEventListener('online', onAvailability);
++            window.removeEventListener('offline', onAvailability);
 +        };
-+    }, [live, enabled, filterKey, processingGetConfig, processingGetLogs]);
++    }, [live, enabled, filterKey, processingGetConfig, processingGetLogs, clearRevision]);
 +
 +    const toggleLive = useCallback(() => {
 +        setLive((previous) => {
@@ -1744,7 +2743,15 @@ index 0000000..ce0b68d
 +            return !previous;
 +        });
 +    }, []);
-+    const clearView = () => dispatch(clearLiveLogsView());
++    const clearView = () => {
++        // Invalidate synchronously so a queued old response cannot refill the cleared table.
++        clearGeneration.current += 1;
++        abort.current?.abort();
++        cancelLogsRequest();
++        baselineOnly.current = checkpoint.current === null;
++        dispatch(clearLiveLogsView({ through: observedHead.current }));
++        setClearRevision((revision) => revision + 1);
++    };
 +    const showNewest = () => {
 +        dispatch(revealPendingLogs());
 +        const element = table.current;
@@ -1755,7 +2762,11 @@ index 0000000..ce0b68d
 +        atTop.current = true;
 +    };
 +
-+    return { live, toggleLive, clearView, showNewest, pendingCount: livePending.length };
++    const status = live ? phase : 'paused';
++    return {
++        live, toggleLive, clearView, showNewest, pendingCount: livePending.length,
++        status: hasGap && status === 'synced' ? 'gap' : status, hasGap,
++    };
 +};
 diff --git a/client/src/components/ui/Icons.tsx b/client/src/components/ui/Icons.tsx
 index 147f21e..6c92367 100644
@@ -1829,10 +2840,10 @@ index ba2de57..d4a8ffb 100644
 +};
 diff --git a/client/src/helpers/liveQueryLog.ts b/client/src/helpers/liveQueryLog.ts
 new file mode 100644
-index 0000000..9a85978
+index 0000000..ee36ad7
 --- /dev/null
 +++ b/client/src/helpers/liveQueryLog.ts
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,147 @@
 +import i18next from 'i18next';
 +
 +import { LocalStorageHelper } from './localStorageHelper';
@@ -1852,6 +2863,7 @@ index 0000000..9a85978
 +    liveSeen: string[];
 +    liveNewest: string;
 +    liveFloor: string;
++    liveClearedThrough?: string;
 +};
 +
 +export const loadLiveLogPreference = () => LocalStorageHelper.getItem(LIVE_LOG_STORAGE_KEY) === true;
@@ -1859,7 +2871,7 @@ index 0000000..9a85978
 +
 +// Preserve the full API timestamp, including sub-millisecond precision. Client metadata
 +// and tracker labels are excluded because they can change between reads of one request.
-+const queryIdentity = (row: LiveLogRow) => JSON.stringify([
++export const queryIdentity = (row: LiveLogRow) => JSON.stringify([
 +    row.time, row.client, row.client_id, row.client_proto, row.domain, row.type,
 +    row.reason, row.status, row.response, row.originalResponse, row.rules,
 +    row.elapsedMs, row.upstream, row.cached, row.answer_dnssec, row.ecs,
@@ -1879,7 +2891,7 @@ index 0000000..9a85978
 +    });
 +};
 +
-+const compareTimes = (left: string, right: string) => {
++export const compareTimes = (left: string, right: string) => {
 +    const milliseconds = Date.parse(left) - Date.parse(right);
 +    const fraction = (time: string) => (time.match(/\.(\d+)/)?.[1] || '').padEnd(9, '0');
 +    return milliseconds || fraction(left).localeCompare(fraction(right));
@@ -1890,11 +2902,13 @@ index 0000000..9a85978
 +
 +    return {
 +        logs, livePending: [], liveSeen: logs.map((row) => row.liveKey),
-+        liveNewest: logs[0]?.time || '', liveFloor: logs[logs.length - 1]?.time || '',
++        liveNewest: logs[0]?.time || '', liveFloor: logs[logs.length - 1]?.time || '', liveClearedThrough: '',
 +    };
 +};
 +
-+export const mergeLiveLogView = <T extends LiveLogView>(state: T, incoming: LiveLogRow[], atTop: boolean): T => {
++export const mergeLiveLogView = <T extends LiveLogView>(
++    state: T, incoming: LiveLogRow[], atTop: boolean, fromTime?: string,
++): T => {
 +    const batch = identifyLiveLogs(incoming);
 +    const seen = new Set([
 +        ...state.liveSeen,
@@ -1903,8 +2917,14 @@ index 0000000..9a85978
 +    ]);
 +    // The regular initial page is smaller than a live page. Do not count older
 +    // backfill as new arrivals or reinsert trimmed/cleared history on later polls.
++    // A retry can recover rows older than those displayed after a partial response.
++    // Its independent acquisition checkpoint permits these rows despite UI trimming.
++    const floor = fromTime !== undefined
++        && (!fromTime || (state.liveFloor && compareTimes(fromTime, state.liveFloor) < 0))
++        ? fromTime : state.liveFloor;
 +    const added = batch.filter((row) => !seen.has(row.liveKey)
-+        && (!state.liveFloor || compareTimes(row.time, state.liveFloor) >= 0));
++        && (!floor || compareTimes(row.time, floor) >= 0)
++        && (!state.liveClearedThrough || compareTimes(row.time, state.liveClearedThrough) > 0));
 +    const newest = batch[0]?.time;
 +    const liveNewest = newest && (!state.liveNewest || compareTimes(newest, state.liveNewest) > 0)
 +        ? newest : state.liveNewest;
@@ -1945,6 +2965,13 @@ index 0000000..9a85978
 +};
 +
 +const LIVE_LOG_STRINGS = {
++    live_log_synced: 'Live / Synced',
++    live_log_catching_up: 'Catching up',
++    live_log_reconnecting: 'Reconnecting',
++    live_log_suspended: 'Suspended',
++    live_log_paused: 'Paused',
++    live_log_gap: 'Gap detected — some queries may not have been recovered.',
++    live_log_status_hint: 'Continuity is checked against previously observed queries. The API cannot guarantee lossless delivery.',
 +    live_log_start: 'Start Live View',
 +    live_log_pause: 'Pause Live View',
 +    live_log_clear: 'Clear view',
@@ -1963,6 +2990,209 @@ index 0000000..9a85978
 +        i18next.addResourceBundle(language, 'translation', LIVE_LOG_STRINGS, true, false);
 +    });
 +    stringsAdded = true;
++};
+diff --git a/client/src/helpers/liveQueryLogRecovery.ts b/client/src/helpers/liveQueryLogRecovery.ts
+new file mode 100644
+index 0000000..a1a45ca
+--- /dev/null
++++ b/client/src/helpers/liveQueryLogRecovery.ts
+@@ -0,0 +1,197 @@
++import {
++    compareTimes, identifyLiveLogs, LIVE_LOG_PAGE_SIZE, LiveLogRow, queryIdentity,
++} from './liveQueryLog';
++
++/** Hard bounds for one sequential catch-up cycle, before the view's 500-row limit. */
++export const LIVE_LOG_RECOVERY_MAX_PAGES = 10;
++export const LIVE_LOG_RECOVERY_MAX_DURATION_MS = 5000;
++export const LIVE_LOG_RECOVERY_MAX_ROWS = 1000;
++
++/** Occurrence keys for the newest timestamp group across successfully processed pages. */
++export interface LiveLogCheckpoint {
++    time: string;
++    keys: string[];
++    /** No observable rebase boundary: probe only the head until a fresh row is available. */
++    limited?: boolean;
++}
++
++/** The caller normalizes and validates rows; an empty oldest string means scan exhaustion. */
++export interface LiveLogPage {
++    logs: LiveLogRow[];
++    oldest: string;
++}
++
++/** Fetch the newest page without a cursor, then pages using the API's older_than cursor. */
++export type LiveLogPageFetcher = (olderThan?: string) => Promise<LiveLogPage>;
++
++/** Optional cancellation, progress notification, monotonic clock, and reduced work budgets. */
++export interface LiveLogRecoveryOptions {
++    /** Aborting or becoming stale rejects with AbortError, including after an in-flight fetch. */
++    signal?: AbortSignal;
++    isCurrent?: () => boolean;
++    /** Called once, immediately before the first additional page request. */
++    onCatchUp?: () => void;
++    /** Defaults to performance.now. The caller must enforce actual request timeouts. */
++    now?: () => number;
++    /** Can reduce, but never increase, the hard bounds. At least one page is fetched. */
++    maxPages?: number;
++    maxDurationMs?: number;
++}
++
++/** Rebase to the newest observed group with gaps explicit; API errors retain the input checkpoint. */
++export interface LiveLogRecoveryResult {
++    /** Sorted newest first; overlapping pages retain the maximum per-page identity multiplicity. */
++    logs: LiveLogRow[];
++    /** Null only when fetching an initial baseline failed. Never mutate this or the input checkpoint. */
++    checkpoint: LiveLogCheckpoint | null;
++    gap: boolean;
++    /** Stable diagnostic code explaining a conservative gap. */
++    reason?: string;
++    /** Fetch failures return partial rows, gap false, and the original checkpoint for retry. */
++    error?: unknown;
++}
++
++const newestFirst = (left: LiveLogRow, right: LiveLogRow) => compareTimes(right.time, left.time);
++const validCursor = (cursor: unknown): cursor is string => typeof cursor === 'string'
++    && (cursor === '' || (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(cursor)
++        && Number.isFinite(Date.parse(cursor))));
++
++export const checkpointFor = (rows: LiveLogRow[]): LiveLogCheckpoint => ({
++    time: rows[0]?.time || '',
++    keys: rows.filter((row) => compareTimes(row.time, rows[0].time) === 0).map((row) => row.liveKey!),
++});
++
++const boundedOption = (value: number | undefined, bound: number, minimum: number) => (
++    value === undefined || !Number.isFinite(value) ? bound : Math.max(minimum, Math.min(bound, value))
++);
++
++/**
++ * Establish a null baseline with one fetch, otherwise catch up until every checkpoint head key is found.
++ * Short or empty filtered pages can still have a progressing cursor. Only oldest === '' proves exhaustion.
++ * Timestamp-only pagination cannot prove continuity for duplicate frontier identities or a full page whose
++ * final two rows share its cursor timestamp; those cases conservatively report a gap, even with overlap.
++ * No checkpoint is mutated. Budgets bound the work between requests; the caller owns request deadlines.
++ */
++export const recoverLiveLogs = async (
++    fetchPage: LiveLogPageFetcher,
++    checkpoint: LiveLogCheckpoint | null,
++    options: LiveLogRecoveryOptions = {},
++): Promise<LiveLogRecoveryResult> => {
++    const now = options.now || (() => performance.now());
++    const started = now();
++    const maxPages = Math.floor(boundedOption(options.maxPages, LIVE_LOG_RECOVERY_MAX_PAGES, 1));
++    const maxDuration = boundedOption(options.maxDurationMs, LIVE_LOG_RECOVERY_MAX_DURATION_MS, 0);
++    const merged = new Map<string, LiveLogRow>();
++    const found = new Set<string>();
++    const cursors = new Set<string>();
++    let ambiguity: string | undefined;
++
++    const assertCurrent = () => {
++        if (options.signal?.aborted || options.isCurrent?.() === false) {
++            throw new DOMException('Live log recovery cancelled', 'AbortError');
++        }
++    };
++    const result = (reason?: string): LiveLogRecoveryResult => {
++        const logs = [...merged.values()].sort(newestFirst);
++        const head = checkpointFor(logs);
++        return {
++            logs,
++            checkpoint: reason && !head.time && checkpoint ? { ...checkpoint, limited: true } : head,
++            gap: Boolean(reason),
++            ...(reason ? { reason } : {}),
++        };
++    };
++
++    let olderThan: string | undefined;
++    // A fixed iteration bound prevents runaway scans, including empty filtered pages.
++    for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
++        assertCurrent();
++        if (pageNumber > 1 && now() - started >= maxDuration) {
++            return result(ambiguity || 'time-budget');
++        }
++        let page: LiveLogPage;
++        try {
++            // Each cursor depends on the preceding response; parallel requests would drift.
++            // eslint-disable-next-line no-await-in-loop
++            page = await fetchPage(olderThan);
++        } catch (error) {
++            assertCurrent();
++            // Preserve cancellation semantics even if the fetcher independently aborts its request.
++            if (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
++                throw error;
++            }
++            return { ...result(), checkpoint, error };
++        }
++        assertCurrent();
++        const rows = identifyLiveLogs([...page.logs].sort(newestFirst));
++        rows.forEach((row) => {
++            if (!merged.has(row.liveKey!)) {
++                merged.set(row.liveKey!, row);
++            }
++        });
++        if (merged.size > LIVE_LOG_RECOVERY_MAX_ROWS) {
++            const retained = [...merged.values()].sort(newestFirst).slice(0, LIVE_LOG_RECOVERY_MAX_ROWS);
++            merged.clear();
++            retained.forEach((row) => merged.set(row.liveKey!, row));
++        }
++
++        if (!validCursor(page.oldest)) {
++            return result('invalid-cursor');
++        }
++        if (page.oldest && (cursors.has(page.oldest)
++            || (olderThan && compareTimes(page.oldest, olderThan) >= 0))) {
++            return result('nonprogressing-cursor');
++        }
++        if (page.oldest) {
++            cursors.add(page.oldest);
++        }
++
++        const last = rows[rows.length - 1];
++        const previous = rows[rows.length - 2];
++        if (rows.length >= LIVE_LOG_PAGE_SIZE && previous
++            && compareTimes(previous.time, last.time) === 0
++            && page.oldest && compareTimes(last.time, page.oldest) === 0) {
++            ambiguity = 'ambiguous-page-boundary';
++        }
++        // The initial page is a baseline, never a request for retrospective history.
++        if (checkpoint === null) {
++            return result(ambiguity);
++        }
++
++        if (checkpoint.limited) {
++            return result('unverified-boundary');
++        }
++        if (checkpoint.time) {
++            const frontier = rows.filter((row) => compareTimes(row.time, checkpoint.time) === 0);
++            frontier.forEach((row) => found.add(row.liveKey!));
++            const identities = frontier.map(queryIdentity);
++            const checkpointIdentities = checkpoint.keys.map((key) => key.replace(/:\d+$/, ''));
++            if (frontier.length && (new Set(identities).size < identities.length
++                || new Set(checkpointIdentities).size < checkpointIdentities.length)) {
++                ambiguity = ambiguity || 'ambiguous-frontier';
++            }
++            if (checkpoint.keys.length && checkpoint.keys.every((key) => found.has(key))) {
++                return result(ambiguity);
++            }
++            if (rows.some((row) => compareTimes(row.time, checkpoint.time) < 0)
++                || (page.oldest && compareTimes(page.oldest, checkpoint.time) < 0)) {
++                return result(ambiguity || 'checkpoint-missing');
++            }
++        }
++        if (page.oldest === '') {
++            return result(ambiguity || (checkpoint.time ? 'checkpoint-missing' : undefined));
++        }
++        if (pageNumber >= maxPages) {
++            return result(ambiguity || 'page-budget');
++        }
++        if (now() - started >= maxDuration) {
++            return result(ambiguity || 'time-budget');
++        }
++        if (pageNumber === 1) {
++            options.onCatchUp?.();
++        }
++        assertCurrent();
++        olderThan = page.oldest;
++    }
++    return result('page-budget');
 +};
 diff --git a/client/src/helpers/statsRange.ts b/client/src/helpers/statsRange.ts
 new file mode 100644
@@ -2152,17 +3382,20 @@ index 7cc2855..c4c04ab 100644
          processingClear: false,
          processingGetConfig: false,
 diff --git a/client/src/reducers/queryLogs.ts b/client/src/reducers/queryLogs.ts
-index 7a05928..997972d 100644
+index 7a05928..9426fbf 100644
 --- a/client/src/reducers/queryLogs.ts
 +++ b/client/src/reducers/queryLogs.ts
-@@ -1,10 +1,52 @@
+@@ -1,10 +1,63 @@
  import { handleActions } from 'redux-actions';
  
-+import { createLiveLogView, mergeLiveLogView, revealLiveLogs } from '../helpers/liveQueryLog';
++import { compareTimes, createLiveLogView, mergeLiveLogView, revealLiveLogs } from '../helpers/liveQueryLog';
 +
  import * as actions from '../actions/queryLogs';
  import { DEFAULT_LOGS_FILTER, DAY, QUERY_LOG_INTERVALS_DAYS, HOUR } from '../helpers/constants';
  
++const filterChanged = (previous: any, next: any) => Object.keys({ ...previous, ...next })
++    .some((key) => previous?.[key] !== next?.[key]);
++
  const queryLogs = handleActions(
      {
 +        [actions.updateLogs.toString()]: (state: any) => ({
@@ -2181,13 +3414,15 @@ index 7a05928..997972d 100644
 +                ...view,
 +                liveEnabled: true,
 +                livePending: state.livePending,
++                liveClearedThrough: state.liveClearedThrough,
 +                liveSeen: state.liveSeen.length ? state.liveSeen : view.liveSeen,
 +                liveNewest: state.liveSeen.length ? state.liveNewest : view.liveNewest,
 +                liveFloor: state.liveSeen.length ? state.liveFloor : view.liveFloor,
 +            };
 +        },
 +        [actions.receiveLiveLogs.toString()]: (state: any, { payload }: any) => {
-+            const next = state.liveEnabled ? mergeLiveLogView(state, payload.logs, payload.atTop) : state;
++            const next = state.liveEnabled
++                ? mergeLiveLogView(state, payload.logs, payload.atTop, payload.fromTime) : state;
 +            return next.logs === state.logs ? next : {
 +                ...next, oldest: next.logs[next.logs.length - 1]?.time || '', isEntireLog: false,
 +            };
@@ -2198,26 +3433,59 @@ index 7a05928..997972d 100644
 +                ...next, oldest: next.logs[next.logs.length - 1]?.time || '', isEntireLog: false,
 +            };
 +        },
-+        [actions.clearLiveLogsView.toString()]: (state: any) => ({
-+            ...state, logs: [], livePending: [], liveFloor: state.liveNewest, oldest: '', isEntireLog: true,
-+        }),
-+        [actions.resetLogsView.toString()]: (state: any) => ({
-+            ...state, logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveEnabled: false,
++        [actions.clearLiveLogsView.toString()]: (state: any, { payload }: any) => {
++            const boundary = [state.liveClearedThrough, state.liveNewest, payload?.through]
++                .filter(Boolean).sort(compareTimes).pop() || '';
++            return {
++                ...state, logs: [], livePending: [], liveClearedThrough: boundary,
++                liveFloor: boundary, oldest: '', isEntireLog: true, processingGetLogs: false,
++                processingAdditionalLogs: false,
++            };
++        },
++        [actions.resetLogsViewRequest.toString()]: (state: any) => ({
++            ...state, logs: [], livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: '', liveEnabled: false,
 +            filter: DEFAULT_LOGS_FILTER, oldest: '', isEntireLog: false, processingGetLogs: false,
 +        }),
          [actions.setFilteredLogsRequest.toString()]: (state: any) => ({
              ...state,
              processingGetLogs: true,
-@@ -28,7 +70,7 @@ const queryLogs = handleActions(
+@@ -22,22 +75,30 @@ const queryLogs = handleActions(
+             const { logs, oldest, filter } = payload;
+ 
+             const isFiltered = filter && Object.keys(filter).some((key) => filter[key]);
++            const boundary = filterChanged(state.filter, filter) ? '' : state.liveClearedThrough;
++            const view = state.liveEnabled ? {
++                ...createLiveLogView(logs.filter((row: any) => !boundary || compareTimes(row.time, boundary) > 0)),
++                liveClearedThrough: boundary,
++            } : { logs, livePending: [], liveSeen: [], liveNewest: '', liveFloor: '', liveClearedThrough: boundary };
+ 
+             return {
+                 ...state,
                  oldest,
                  filter,
                  isFiltered,
 -                logs,
-+                ...(state.liveEnabled ? createLiveLogView(logs) : { logs, livePending: [], liveSeen: [], liveNewest: '', liveFloor: '' }),
++                ...view,
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -50,10 +92,11 @@ const queryLogs = handleActions(
+         },
+ 
+-        [actions.setLogsFilterRequest.toString()]: (state, { payload }: any) => ({
+-            ...state,
+-            filter: payload,
+-        }),
++        [actions.setLogsFilterRequest.toString()]: (state: any, { payload }: any) => {
++            const changed = filterChanged(state.filter, payload);
++            return {
++                ...state, filter: payload,
++                ...(changed ? { ...createLiveLogView([]), oldest: '', isEntireLog: false } : {}),
++            };
++        },
+ 
+         [actions.getLogsRequest.toString()]: (state: any) => ({
+             ...state,
+@@ -50,10 +111,11 @@ const queryLogs = handleActions(
          [actions.getLogsSuccess.toString()]: (state: any, { payload }: any) => {
              const { logs, oldest, older_than } = payload;
  
@@ -2230,7 +3498,7 @@ index 7a05928..997972d 100644
                  isEntireLog: logs.length < 1,
                  processingGetLogs: false,
              };
-@@ -129,6 +172,11 @@ const queryLogs = handleActions(
+@@ -129,6 +191,12 @@ const queryLogs = handleActions(
          processingAdditionalLogs: false,
          interval: DAY,
          logs: [],
@@ -2239,6 +3507,7 @@ index 7a05928..997972d 100644
 +        liveSeen: [],
 +        liveNewest: '',
 +        liveFloor: '',
++        liveClearedThrough: '',
          enabled: true,
          oldest: '',
          filter: DEFAULT_LOGS_FILTER,

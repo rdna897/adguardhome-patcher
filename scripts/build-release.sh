@@ -15,8 +15,8 @@
 #
 # Gate: the stats API still documents "recent", the patch applies (three-way
 # against PATCH_BASE), applied-source whitespace, typecheck, eslint, unit tests,
-# production build, and a smoke test that runs the official binary of the
-# release with the patched UI.  Set SMOKE_TEST=0 to skip the last step.
+# production build, and a real-DNS/Query Log integration test using the official
+# release binary with the patched UI. Set SMOKE_TEST=0 to skip binary checks.
 #
 # The UI manifest's patch_revision is the SHA-256 artefact revision of the built
 # build/static files.  Webpack's CSS names include a compilation hash that
@@ -72,53 +72,16 @@ host_arch() {
 	esac
 }
 
-# smoke_test starts the official binary of the release with the patched UI and
-# checks that the UI is served, stats accepts "recent", and Query Log supports
-# the existing filtered, limited requests used for live frontend polling.
+# Reuse one official download/instance for frontend smoke, genuine DNS traffic,
+# real Query Log pagination, and the production catch-up helper/UI integration.
 smoke_test() {
-	local dir="$work/smoke" arch port pid ok=1 i
-	arch=$(host_arch) || { echo "unsupported architecture, skipping"; return 0; }
-	mkdir -p "$dir/work" "$dir/build"
-	curl -fsSL -o "$dir/agh.tgz" \
+	local dir="$work/smoke" arch
+	arch=$(host_arch) || { echo "unsupported architecture for official-binary integration"; return 1; }
+	mkdir -p "$dir"
+	curl -fsSL --connect-timeout 10 --max-time 60 -o "$dir/agh.tgz" \
 		"https://github.com/AdguardTeam/AdGuardHome/releases/download/$tag/AdGuardHome_linux_$arch.tar.gz"
 	tar xzf "$dir/agh.tgz" -C "$dir"
-	cp -r "$src/build/static" "$dir/build/static"
-	port=$((20000 + RANDOM % 20000))
-
-	# A first launch refuses to start without root, and CI runners aren't
-	# root, so use sudo there.
-	(cd "$dir" && exec $SUDO ./AdGuardHome/AdGuardHome --local-frontend --no-check-update \
-		-w "$dir/work" --web-addr "127.0.0.1:$port" >"$dir/agh.log" 2>&1) &
-	pid=$!
-
-	local base="http://127.0.0.1:$port"
-	for i in $(seq 1 30); do
-		curl -s -o /dev/null "$base/" && break
-		sleep 1
-	done
-
-	local main_js
-	main_js=$(grep -o 'main\.[a-f0-9]*\.js' "$src/build/static/index.html" | head -n 1)
-	if curl -fsS -X POST "$base/control/install/configure" \
-		-H 'Content-Type: application/json' \
-		-d "{\"web\":{\"ip\":\"127.0.0.1\",\"port\":$port},\"dns\":{\"ip\":\"127.0.0.1\",\"port\":$((port + 1))},\"username\":\"smoke\",\"password\":\"smoke-test-password\"}"; then
-		sleep 3
-		curl -fsS -c "$dir/cj" -X POST "$base/control/login" \
-			-H 'Content-Type: application/json' \
-			-d '{"name":"smoke","password":"smoke-test-password"}' \
-			&& curl -fsS -b "$dir/cj" "$base/" | grep -q "$main_js" \
-			&& curl -fsS -b "$dir/cj" "$base/control/stats?recent=3600000" | grep -q num_dns_queries \
-			&& curl -fsS -b "$dir/cj" "$base/control/querylog?limit=100&search=smoke&response_status=all" | grep -q '"data"' \
-			&& ok=0
-	fi
-
-	$SUDO kill "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
-	if [ "$ok" != 0 ]; then
-		tail -n 30 "$dir/agh.log"
-	fi
-
-	return "$ok"
+	node "$repo_root/scripts/tests/querylog-real-api.cjs" "$src" "$dir/AdGuardHome/AdGuardHome" "$tag"
 }
 
 rm -f "$out/REASON" "$out"/agh-dashboard-range.tar.gz* "$out"/agh-dashboard-range-source.tar.gz* "$out"/agh-patcher-tools.tar.gz*

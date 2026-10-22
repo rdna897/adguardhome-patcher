@@ -4,19 +4,39 @@ The repository is for development and source distribution. Supported installatio
 
 ## Build
 
-Requirements: Node.js 22, Python 3.9+, Git, curl, tar and sudo when the official binary smoke test needs elevated permissions.
+Requirements: Node.js 22, Python 3.9+, Git, curl and tar. The official-binary test runs without elevated permissions. Browser checks use the existing Playwright Chromium/dependency setup.
 
 ```sh
 BROWSER_TEST=1 scripts/build-release.sh v0.107.79 dist
 ```
 
-The supported patch base is `patch/PATCH_BASE`. The gate checks validation regressions, temporary native/Docker management installations, the root `install.sh` bootstrap with fake downloads, patch application, applied-source whitespace, type checking, lint, frontend tests, production output, optional desktop/mobile browser tests and the official binary/HTTP smoke test. It generates and verifies three archives and their SHA-256 files:
+The supported patch base is `patch/PATCH_BASE`. The gate checks validation regressions, temporary native/Docker management installations, the root `install.sh` bootstrap with fake downloads, patch application, applied-source whitespace, type checking, lint, frontend tests, production output, optional desktop/mobile browser tests and the official-binary DNS/Query Log integration test, including HTTP smoke checks. It generates and verifies three archives and their SHA-256 files:
 
 - `agh-patcher-tools.tar.gz`: the two installers, Docker override, manager, launcher, release manifest module, licence and generated `TOOLS.json`. It contains no development files. Installation checks the version and every listed file hash without requiring the source tree.
 - `agh-dashboard-range.tar.gz`: compiled frontend, compatibility version, manifest, notice and licence.
 - `agh-dashboard-range-source.tar.gz`: corresponding patched upstream source plus the patcher build/release/install sources for the released artefacts, for GPL distribution. It is not a complete repository mirror.
 
 Archive verification recomputes the frontend revision, compares tools/source bytes to the build tree, checks the tools inventory and all three checksums, and rejects packaged host scheduler units.
+
+## Real Query Log integration
+
+The binary stage downloads the official release once and passes that unchanged binary to `scripts/tests/querylog-real-api.cjs`. It retains the frontend-serving and `stats?recent` smoke checks, and tests real DNS traffic, HTTP cursor pagination, and the production Stage 1 recovery helper. `SMOKE_TEST=0` explicitly skips this stage; PR validation does not set it and always runs the integration test.
+
+The test writes a complete disposable configuration before startup, avoiding the first-run installer and its root requirement. Web and both DNS listeners bind only to `127.0.0.1` on dynamically reserved non-privileged ports; port 53 and host DNS settings are never used. The work/configuration, credentials and all query history belong to a new temporary directory. A random username and a fixed test-only password authenticate this instance. Filtering lists, client reverse lookups, WHOIS, host-file lookups and update checks are disabled. A wildcard rewrite answers a unique `.invalid` marker with `192.0.2.123`; configured upstream, bootstrap, fallback and private resolvers point only to a local fail-closed DNS trap. Any upstream traffic fails the test. Rate limiting and the DNS cache are disabled for this instance.
+
+Every DNS request is sent over a localhost UDP socket and must receive a matching, successful A response. Serial requests have 1ms separation to avoid depending on timestamp ties. A 64-record query-log buffer with file logging enabled exercises both memory and file-backed reads, without inserting or altering log records. Bounded API readiness checks wait for every expected unique domain, rather than sleeping for asynchronous log writes.
+
+The test generates **1,352 genuine queries**: one checkpoint anchor, 251 burst records, then 1,100 overflow records. The isolated 251-record search must return data pages of **100, 100 and 51**, newest first, without duplicates or omissions. It follows the actual `oldest` cursor until exhaustion: v0.107.79 returns a nonempty cursor on the short final page, then an empty page/cursor. Every request uses `limit=100` and the marker search, never `offset`; the primary scan uses `response_status=all`. Cursors retain their complete RFC3339Nano precision and timezone offset; an exact boundary request verifies exclusive `older_than` behaviour.
+
+The locked frontend build dependencies bundle the actual recovery helper and normalizer for Node; the test contains no alternate recovery algorithm. The 251 arrivals plus anchor recover in three requests without a gap. The overflow exhausts the production ten-page budget, reports `page-budget`, and rebases to a single-page next poll. A final API scan verifies all 1,352 records and timestamps remain unchanged. With `BROWSER_TEST=1`, a focused production-browser scenario uses this same real server and confirms normal synchronisation, the persistent gap warning and one-page polling after rebase. An online availability event triggers the rebase cycle; the assertion requires its observable Catching up to gap-only status transition before checking the request count, proving recovery finished rather than rechecking the previous cycle's warning. Its network guard rejects external origins and the server-clear endpoint; it does not mock Query Log responses.
+
+The 251-record burst is also paginated with the effective `response_status=rewritten` filter: its rows and cursors must match the `all` scan exactly, while `response_status=blocked` must return no records. A separate rewritten-filter baseline and production-helper catch-up verify that every recovery request preserves that filter. Every nonempty page must return its final record's exact timestamp as `oldest`, including sub-millisecond precision. Recovery checks also assert that the supplied checkpoint is never mutated. Limiting the same three-page burst to two requests must return exactly the newest 200 rows, report a `page-budget` gap and rebase subsequent polling to one request; it cannot claim to have reached the older anchor.
+
+HTTP requests have five-second deadlines, DNS responses two seconds, readiness checks thirty seconds, scans twenty pages, and the entire disposable test a 120-second watchdog. Failure diagnostics include missing domains, page/cursor details and the binary's recent output. Cleanup runs on success, exceptions, SIGINT, SIGTERM and SIGHUP, closes the browser, stops the child (with a three-second kill fallback), closes sockets and removes its temporary directory. The gate's existing trap removes the downloaded binary. The test requires no production credentials, volumes, services or additional dependencies.
+
+Exact nanosecond ties cannot be forced reliably through the unchanged binary's clock. The real test checks strict timestamp exclusion; the existing deterministic unit tests separately cover tied boundaries and indistinguishable events. Other [Query Log API limitations](live-query-log-controls.md#api-limits), including missing event IDs and the absence of a stable snapshot, still apply.
+
+In v0.107.79, [`searchFiles` limits each file scan to 50,000 candidates](https://github.com/AdguardTeam/AdGuardHome/blob/v0.107.79/internal/querylog/search.go), including nonmatching records. Consequently a sparse filter can return an empty page with a continuation cursor, and `oldest` may identify a scanned nonmatching record. The integration's 1,352-record dataset does not reach that scan cap; deterministic recovery tests cover sparse and empty continuing pages. Neither a short page nor an empty data array alone proves exhaustion. Candidate selection also precedes response sorting, so the serial-query fixture establishes ordinary pagination without claiming a stable snapshot under concurrent or delayed writes.
 
 ## Release identities
 
