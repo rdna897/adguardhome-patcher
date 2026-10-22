@@ -21,8 +21,8 @@ async function check(environment) {
                 `Expected strictly descending real timestamps: ${rows[index - 1].time}, ${rows[index].time}`);
         }
     };
-    const queryPage = async (search, olderThan, signal) => {
-        const params = new URLSearchParams({ limit: '100', search, response_status: 'all' });
+    const queryPage = async (search, olderThan, signal, responseStatus = 'all') => {
+        const params = new URLSearchParams({ limit: '100', search, response_status: responseStatus });
         if (olderThan !== undefined) params.set('older_than', olderThan);
         assert.equal(params.has('offset'), false);
         const response = await (await request(`/control/querylog?${params}`, { signal })).json();
@@ -36,17 +36,21 @@ async function check(environment) {
             if (olderThan) assert.ok(compareTimes(row.time, olderThan) < 0, 'older_than must be strictly exclusive');
         }
         ordered(response.data);
+        if (response.data.length) {
+            assert.equal(response.oldest, response.data.at(-1).time,
+                'Nonempty page cursor must preserve the oldest returned timestamp byte-for-byte');
+        }
         if (olderThan && response.oldest) {
             assert.ok(compareTimes(response.oldest, olderThan) < 0, 'Cursor must advance strictly backwards');
         }
         return response;
     };
-    const collect = async search => {
+    const collect = async (search, responseStatus = 'all') => {
         const pages = [];
         const rows = [];
         let cursor;
         for (let index = 0; index < 20; index += 1) {
-            const page = await queryPage(search, cursor);
+            const page = await queryPage(search, cursor, undefined, responseStatus);
             pages.push({ size: page.data.length, requested: cursor, oldest: page.oldest });
             rows.push(...page.data);
             if (!page.oldest) {
@@ -71,15 +75,17 @@ async function check(environment) {
         expectDomains(result.rows, expected);
         return result;
     });
-    const recovery = async (checkpoint, options = {}) => {
+    const recovery = async (checkpoint, options = {}, responseStatus = 'all') => {
         const calls = [];
+        const original = structuredClone(checkpoint);
         const signal = AbortSignal.timeout(LIVE_LOG_RECOVERY_MAX_DURATION_MS);
         const result = await recoverLiveLogs(async cursor => {
             calls.push(cursor);
-            const page = await queryPage(marker, cursor, signal);
+            const page = await queryPage(marker, cursor, signal, responseStatus);
             return { logs: normalizeLogs(page.data), oldest: page.oldest };
         }, checkpoint, { ...options, signal });
         assert.equal(result.error, undefined, `Recovery API error: ${result.error}`);
+        assert.deepEqual(checkpoint, original, 'Recovery must not mutate its input checkpoint');
         return { result, calls };
     };
 
@@ -97,6 +103,9 @@ async function check(environment) {
     assert.equal(initial.result.gap, false);
     assert.equal(initial.result.logs[0].domain, anchor);
     const checkpoint = initial.result.checkpoint;
+    const rewrittenBaseline = await recovery(null, {}, 'rewritten');
+    assert.deepEqual(rewrittenBaseline.result, initial.result,
+        'The supported rewritten filter must include the genuine rewrite checkpoint');
 
     // The browser, when enabled by the existing gate, talks directly to the same official API.
     let browser;
@@ -169,7 +178,7 @@ async function check(environment) {
         assert.ok(diskLog.size > 0, 'Generated traffic must exercise file-backed query-log reads');
         const pagination = await collect(`burst.${marker}`);
         expectDomains(pagination.rows, burst);
-        assert.deepEqual(pagination.pages.filter(item => item.size).map(item => item.size), [100, 100, 51]);
+        assert.deepEqual(pagination.pages.map(item => item.size), [100, 100, 51, 0]);
         assert.deepEqual(names(pagination.rows), [...burst].reverse(), 'Newest matching queries must appear first');
         assert.ok(pagination.rows.some(row => /\.\d{4,9}(?:Z|[+-]\d\d:\d\d)$/.test(row.time)), 'Sub-millisecond API precision retained');
         const boundary = pagination.rows[99];
@@ -177,6 +186,15 @@ async function check(environment) {
         assert.ok(!names(afterBoundary.data).includes(boundary.question.name), 'Exact timestamp excludes its boundary record');
         assert.equal(afterBoundary.data[0].question.name, pagination.rows[100].question.name);
         console.log(`Real pagination (251 DNS queries): ${JSON.stringify(pagination.pages)}`);
+
+        // Exercise effective status filtering, not just the no-op "all" parameter.
+        // The same real records must paginate identically with rewritten, while
+        // blocked must exclude them. All cursor requests retain both filters.
+        const rewritten = await collect(`burst.${marker}`, 'rewritten');
+        assert.deepEqual(rewritten, pagination, 'Status-filtered pagination must retain every rewrite');
+        const blocked = await collect(`burst.${marker}`, 'blocked');
+        assert.deepEqual(blocked.rows, [], 'Rewrite traffic must not leak through the blocked filter');
+        assert.equal(blocked.pages.at(-1).oldest, '');
 
         const caughtUp = await recovery(checkpoint);
         assert.equal(caughtUp.result.gap, false, `Unexpected recovery gap: ${caughtUp.result.reason}`);
@@ -187,6 +205,25 @@ async function check(environment) {
         assert.equal(caughtUp.result.checkpoint.time, normal.rows[0].time);
         assert.notEqual(caughtUp.result.checkpoint.time, checkpoint.time);
         console.log('Production recovery: 251/251 new queries + previous checkpoint, 3 pages, ordered/deduplicated, no gap');
+
+        const filteredCatchUp = await recovery(rewrittenBaseline.result.checkpoint, {}, 'rewritten');
+        assert.deepEqual(filteredCatchUp, caughtUp, 'Production catch-up must preserve the effective status filter');
+        console.log('Real status filters: rewritten -> 100,100,51,0; blocked -> 0; filtered recovery -> 251/251');
+
+        // Reuse the proven three-page dataset to test a deliberately smaller
+        // recovery budget, independently of the later production-budget overflow.
+        const reducedBudget = await recovery(checkpoint, { maxPages: 2 });
+        assert.deepEqual(reducedBudget.calls, caughtUp.calls.slice(0, 2));
+        assert.equal(reducedBudget.result.reason, 'page-budget');
+        assert.equal(reducedBudget.result.gap, true, 'A missing checkpoint must never claim continuity');
+        assert.deepEqual(reducedBudget.result.logs.map(row => row.domain), [...burst].reverse().slice(0, 200));
+        assert.deepEqual(reducedBudget.result.checkpoint, caughtUp.result.checkpoint,
+            'Incomplete recovery must rebase to the newest observed checkpoint');
+        const reducedRebase = await recovery(reducedBudget.result.checkpoint, { maxPages: 2 });
+        assert.equal(reducedRebase.calls.length, 1, 'Reduced-budget gap must not repeat historical backfill');
+        assert.equal(reducedRebase.result.gap, false);
+        assert.deepEqual(reducedRebase.result.checkpoint, reducedBudget.result.checkpoint);
+        console.log('Reduced recovery budget: exactly 2 pages / 200 rows -> page-budget gap -> 1-page rebase');
 
         if (page) {
             const { expect } = createRequire(path.join(source, 'client/package.json'))('@playwright/test');
@@ -223,12 +260,17 @@ async function check(environment) {
                 return url.pathname === '/control/querylog' && url.searchParams.get('limit') === '100'
                     && !url.searchParams.has('older_than');
             });
-            await page.clock.runFor(1000);
+            // Availability triggers an observable Catching up -> Gap transition.
+            // The final gap-only status then proves this recovery cycle finished,
+            // rather than merely observing the warning from the preceding cycle.
+            await page.evaluate(() => window.dispatchEvent(new Event('online')));
+            await expect(syncStatus).toContainText('Catching up');
+            await page.clock.runFor(1);
             const response = await rebaseResponse;
             assert.equal(response.status(), 200, 'Rebased UI poll must succeed');
             assert.equal(await response.finished(), null, 'Rebased UI response must finish successfully');
-            await expect.poll(() => uiRequests.length - rebaseStart).toBe(1);
             await expect(syncStatus).toHaveText('Gap detected — some queries may not have been recovered.');
+            assert.equal(uiRequests.length - rebaseStart, 1, 'Completed rebased UI cycle must fetch only the head');
             console.log('Real-API production UI: Synced after 251 arrivals; sticky Gap after 10-page overflow; next poll 1 page');
         } else {
             console.log('Real-API browser scenario not requested (BROWSER_TEST != 1); DNS/API/helper checks executed');
